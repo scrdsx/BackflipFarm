@@ -228,9 +228,9 @@ local function buildPath(s)
 			return true
 		end
 		-- no silent fallback: riding some other route unseen is what we are avoiding
+		if Farm.Stats.road ~= why then warn("[Scrdsx] road route failed: " .. tostring(why)) end -- once per reason
 		Farm.Stats.road = why or "failed"
 		status("Road route failed (see Route tab)")
-		warn("[Scrdsx] road route failed: " .. tostring(why))
 		return false
 	end
 	local n = #Farm.Route

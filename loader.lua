@@ -33,8 +33,8 @@ local function req(name)
 	if cache[name] == nil then
 		local src = sources[name]
 		assert(src, "unknown module: " .. tostring(name))
-		-- inject `require` on the first line so error line numbers stay correct
-		local fn, err = loadstring("local require = ...;" .. src, "=" .. name)
+		-- inject `__import` on the first line so error line numbers stay correct (never shadow Roblox's require)
+		local fn, err = loadstring("local __import = ...;" .. src, "=" .. name)
 		assert(fn, name .. ": " .. tostring(err))
 		cache[name] = fn(req)
 		if cache[name] == nil then cache[name] = true end

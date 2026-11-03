@@ -1,7 +1,7 @@
 local UIS = game:GetService("UserInputService")
-local UI = require("ui")
-local Farm = require("farm")
-local Loading = require("loading")
+local UI = __import("ui")
+local Farm = __import("farm")
+local Loading = __import("loading")
 
 -- re-run safe: tear down a previous instance
 if getgenv then
