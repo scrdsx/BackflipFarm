@@ -23,7 +23,7 @@ local Farm = {
 		AutoRaise = true,    -- raise JumpVy when a flip fails to register
 		AvoidObstacles = true,
 		Wheelie = true,      -- hold a wheelie, then backflip out of it
-		WheelieTime = 0.6,   -- seconds held before the flip
+		WheelieTime = 0.25,  -- seconds the wheelie is held before the flip
 		WheeliePitch = 40,   -- degrees the nose is held at
 		LoopRoute = true,    -- loop when the route's ends meet, otherwise ride it back and forth
 		MaxRouteDist = 250,  -- refuse to drive if the route is farther than this from you
@@ -181,7 +181,7 @@ local function straightness(path)
 	return math.max(best, run)
 end
 
--- try a handful of far-away road points and keep the route with the longest straight stretch
+-- a long loop on the roads: start -> A -> B -> start, picked for long straight stretches
 local function roadPath(pos)
 	local g, why = getRoads()
 	if not g then return nil, why end
@@ -194,23 +194,35 @@ local function roadPath(pos)
 	local cands = {}
 	for _, p in ipairs(g.points) do
 		local d = (p - here).Magnitude
-		if d > 300 and d < 1200 then cands[#cands + 1] = p end
+		if d > 250 and d < 1500 then cands[#cands + 1] = p end
 	end
-	if #cands == 0 then
-		for _, p in ipairs(g.points) do
-			if (p - here).Magnitude > 100 then cands[#cands + 1] = p end
-		end
+	if #cands < 2 then return nil, "not enough road around you" end
+	local function v3(p) return Vector3.new(p.X, 0, p.Y) end
+	local function leg(a, b)
+		local ok, path = pcall(function() return g:route(a, b) end)
+		if ok and path and #path >= 2 then return path end
 	end
 	local best, bestScore
-	for _ = 1, math.min(14, #cands) do
-		local p = cands[math.random(#cands)]
-		local ok, path = pcall(function() return g:route(pos, Vector3.new(p.X, 0, p.Y)) end)
-		if ok and path and #path >= 3 then
-			local score = straightness(path)
-			if not bestScore or score > bestScore then best, bestScore = path, score end
+	for _ = 1, 10 do
+		local A, B = cands[math.random(#cands)], cands[math.random(#cands)]
+		if (A - B).Magnitude > 250 then
+			local l1, l2, l3 = leg(pos, v3(A)), leg(v3(A), v3(B)), leg(v3(B), pos)
+			if l1 and l2 and l3 then
+				local path, length = {}, 0
+				for _, l in ipairs({ l1, l2, l3 }) do
+					for i, p in ipairs(l) do
+						if not (#path > 0 and i == 1) then -- legs share their joint point
+							if #path > 0 then length += flat(p - path[#path]).Magnitude end
+							path[#path + 1] = p
+						end
+					end
+				end
+				local score = straightness(path) + length * 0.05
+				if not bestScore or score > bestScore then best, bestScore = path, score end
+			end
 		end
 	end
-	if not best then return nil, "no road route found" end
+	if not best then return nil, "no road loop found" end
 	return best
 end
 
@@ -220,8 +232,8 @@ local function buildPath(s)
 		local path, why = roadPath(s.Position)
 		if path then
 			pts = path
-			loop, idx, step = false, 2, 1 -- ride along the road, then back
-			Farm.Stats.mode = "Road (" .. #pts .. " pts)"
+			loop, idx, step = true, 2, 1 -- one long loop on the roads
+			Farm.Stats.mode = "Road loop (" .. #pts .. " pts)"
 			Farm.Stats.points = #pts
 			Farm.Stats.road = "ok"
 			changed()
@@ -299,7 +311,7 @@ local function endTrick(restore)
 	lastEnd, distSince, lastPos = os.clock(), 0, nil
 end
 
--- backflip: jump + spin, then hold the ride level until it lands
+-- backflip: jump + spin at full ride speed, hold the ride level until it lands
 local function backflip(s, ahead, restoreIn)
 	local cfg = Farm.Config
 	flipping, pending = true, true
@@ -308,11 +320,11 @@ local function backflip(s, ahead, restoreIn)
 	local airtime = 2 * cfg.JumpVy / workspace.Gravity
 	local w = 2 * math.pi / (airtime * 0.6) * dir -- finish the turn well before landing
 	local restore = restoreIn or releaseStabilizers(s.Parent)
-	local hv = ahead * cfg.CruiseSpeed * 0.7 -- slower over the jump = shorter flight
+	local hv = ahead * cfg.CruiseSpeed -- same speed as the ride
 	s.AssemblyLinearVelocity = Vector3.new(hv.X, cfg.JumpVy, hv.Z)
 	status("Flipping")
 
-	local turned, t, cfMode, landUntil = 0, 0, false, nil
+	local turned, t, landUntil = 0, 0, nil
 	local prevUp = s.CFrame.UpVector
 	flipConn = RunService.Heartbeat:Connect(function(dt)
 		dt = math.min(dt, 0.05)
@@ -345,32 +357,29 @@ local function backflip(s, ahead, restoreIn)
 			return
 		end
 		local right = s.CFrame.RightVector
-		if cfMode then
-			s.AssemblyAngularVelocity = Vector3.zero
-			s.CFrame = s.CFrame * CFrame.Angles(w * dt, 0, 0)
-		else
-			s.AssemblyAngularVelocity = right * w
-		end
+		s.AssemblyAngularVelocity = right * w
 		-- measure the real rotation about the right vector
 		local up = s.CFrame.UpVector
 		turned += math.abs(math.atan2(prevUp:Cross(up):Dot(right), prevUp:Dot(up)))
 		prevUp = up
-		if not cfMode and t > 0.25 and turned < 0.3 then cfMode = true end -- physics isn't turning it: drive the CFrame
-		if turned >= 2 * math.pi * 0.98 or t > airtime + 0.6 then
+		-- stay on schedule: if physics turns it too slowly, rotate the missing part directly so the flip always completes
+		local deficit = math.min(math.abs(w) * t, 2 * math.pi) - turned
+		if deficit > 0.04 then s.CFrame = s.CFrame * CFrame.Angles(math.sign(w) * deficit * 0.6, 0, 0) end
+		if turned >= 2 * math.pi or t > airtime + 0.6 then
 			landUntil = os.clock() + math.max(0.2, airtime - t) + 0.25
 		end
 	end)
 end
 
--- wheelie: raise the nose to a held angle while riding, then hand over to the backflip
+-- wheelie: nose up while riding at full speed, then straight into the backflip (no stopping)
 local function wheelieThenFlip(s, ahead)
 	local cfg = Farm.Config
 	flipping = true
 	status("Wheelie")
 	local restore = releaseStabilizers(s.Parent)
-	local hv = ahead * cfg.CruiseSpeed * 0.8
+	local hv = ahead * cfg.CruiseSpeed
 	local target = math.rad(cfg.WheeliePitch)
-	local t = 0
+	local t, held = 0, nil
 	flipConn = RunService.Heartbeat:Connect(function(dt)
 		dt = math.min(dt, 0.05)
 		if not Farm.Enabled or not s.Parent or seat() ~= s then
@@ -383,10 +392,10 @@ local function wheelieThenFlip(s, ahead)
 		t += dt
 		-- pitch measured in the same rotation direction the backflip will use
 		local pitch = dir * math.asin(math.clamp(s.CFrame.LookVector.Y, -1, 1))
-		local err = target * math.min(t / 0.5, 1) - pitch
-		s.AssemblyAngularVelocity = s.CFrame.RightVector * dir * math.clamp(err * 8, -4, 4)
+		local err = target * math.min(t / 0.25, 1) - pitch
+		s.AssemblyAngularVelocity = s.CFrame.RightVector * dir * math.clamp(err * 10, -5, 5)
 		local v = s.AssemblyLinearVelocity
-		s.AssemblyLinearVelocity = Vector3.new(hv.X, v.Y, hv.Z)
+		s.AssemblyLinearVelocity = Vector3.new(hv.X, v.Y, hv.Z) -- keep the ride speed
 		if pitch > math.rad(80) then -- going over: abort, level out
 			flipConn:Disconnect()
 			s.AssemblyAngularVelocity = Vector3.zero
@@ -394,7 +403,10 @@ local function wheelieThenFlip(s, ahead)
 			if fl.Magnitude > 0.05 then s.CFrame = CFrame.lookAt(s.Position, s.Position + fl.Unit) end
 			endTrick(restore)
 			status("Wheelie too steep, aborted")
-		elseif (t >= cfg.WheelieTime and pitch >= target * 0.7) or t > 2.5 then
+			return
+		end
+		if pitch >= target * 0.8 then held = held or t end
+		if (held and t - held >= cfg.WheelieTime) or t > 1.2 then
 			flipConn:Disconnect()
 			backflip(s, ahead, restore)
 		end
@@ -406,11 +418,40 @@ local function startTrick(s, ahead)
 end
 
 -- driving --------------------------------------------------------------------
+local function prevIdx()
+	if loop then return ((idx - 2) % #pts) + 1 end
+	return math.clamp(idx - step, 1, #pts)
+end
+
+-- pure pursuit: the point `L` studs ahead along the path, measured from where we are on it.
+-- Steering at that point keeps the ride on the road instead of cutting corners between points.
+local function pursuit(pos, L)
+	local a, b = flat(pts[prevIdx()]), flat(pts[idx])
+	local ab = b - a
+	local len2 = ab:Dot(ab)
+	local t = len2 > 0.01 and math.clamp(flat(pos - a):Dot(ab) / len2, 0, 1) or 1
+	local cur = a + ab * t
+	local rem, i = L, idx
+	for _ = 1, #pts + 2 do
+		local seg = flat(pts[i]) - cur
+		local d = seg.Magnitude
+		if d >= rem then return cur + (d > 0.01 and seg.Unit * rem or Vector3.zero), t end
+		rem -= d
+		cur = flat(pts[i])
+		local n = nextIdx(i)
+		if not n then return cur, t end
+		i = n
+	end
+	return cur, t
+end
+
 local function drive(s, dt)
 	local cfg = Farm.Config
 	local pos = s.Position
-	local to = flat(pts[idx] - pos)
-	if to.Magnitude < 8 then advance(); return end
+	local target, along = pursuit(pos, math.clamp(cfg.CruiseSpeed * 0.6, 12, 40))
+	if along >= 0.999 or flat(pts[idx] - pos).Magnitude < 6 then advance() end
+	local to = flat(target - pos)
+	if to.Magnitude < 1 then return end
 	local want = to.Unit
 
 	local f = flat(s.CFrame.LookVector) * fwd
@@ -424,23 +465,27 @@ local function drive(s, dt)
 	if nf.Magnitude < 0.05 then return end
 	nf = nf.Unit
 
-	-- obstacle ahead: stop; after a moment turn back along the route
+	-- obstacle ahead: stop and wait; a ping-pong route turns back, a loop waits then picks a fresh route
 	if cfg.AvoidObstacles and blocked(s, nf, cfg.CruiseSpeed * 0.6 + 6) then
 		blockedSince = blockedSince or os.clock()
 		local v = s.AssemblyLinearVelocity
 		s.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
-		status("Blocked, turning back")
-		if os.clock() - blockedSince > 0.8 then
-			loop = false
-			step = -step
-			idx = math.clamp(idx + step, 1, #pts)
+		status("Blocked, waiting")
+		if os.clock() - blockedSince > (loop and 5 or 0.8) then
+			if loop then
+				pts = {} -- new route from here
+			else
+				step = -step
+				idx = math.clamp(idx + step, 1, #pts)
+			end
 			blockedSince = nil
 		end
 		return
 	end
 	blockedSince = nil
 
-	local speed = cfg.CruiseSpeed * math.clamp(1 - math.abs(ang) / 1.2, 0.35, 1)
+	-- same speed all the way; only slow for sharp corners
+	local speed = cfg.CruiseSpeed * math.clamp(1 - math.abs(ang) / 1.4, 0.5, 1)
 	local v = s.AssemblyLinearVelocity
 	s.AssemblyLinearVelocity = Vector3.new(nf.X * speed, v.Y, nf.Z * speed)
 	status("Riding")
@@ -450,8 +495,8 @@ local function drive(s, dt)
 
 	-- trick when far enough from the last one, with a straight, clear run for the wheelie + flight
 	local airtime = 2 * cfg.JumpVy / workspace.Gravity
-	local run = cfg.CruiseSpeed * 0.7 * airtime
-	if cfg.Wheelie then run += cfg.CruiseSpeed * 0.8 * (cfg.WheelieTime + 0.5) end
+	local run = cfg.CruiseSpeed * airtime
+	if cfg.Wheelie then run += cfg.CruiseSpeed * (0.4 + cfg.WheelieTime) end
 	local gate
 	if distSince < cfg.FlipSpacing then gate = ("riding %d/%d studs"):format(distSince, cfg.FlipSpacing)
 	elseif math.abs(ang) >= 0.3 then gate = "turning"
