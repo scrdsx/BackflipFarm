@@ -1,6 +1,7 @@
--- Backflip farm (v2). Rides a loop made of the straightest roads it can find, and as soon as the ride is on the
--- ground with a gentle stretch ahead it does a short wheelie into a backflip, lands, and goes again.
--- One step loop, one trick state machine. The server detects tricks from physics; TrickState reports the result.
+-- Backflip farm (v3). Rides a continuous circuit built around the straightest road it can find (out along that
+-- road, back by a different one), and every time the ride is on the ground with a gentle stretch ahead it does a
+-- short wheelie into a backflip, lands, and goes again. One step loop, one trick state machine.
+-- The server detects tricks from physics; TrickState reports the result.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local RS = game:GetService("ReplicatedStorage")
@@ -10,36 +11,38 @@ local lp = Players.LocalPlayer
 
 local Farm = {
 	Config = {
-		CruiseSpeed = 70,    -- studs/s, also the speed through the air
-		JumpVy = 85,         -- launch speed; airtime = 2*vy/g
-		MaxVy = 120,         -- auto-raise ceiling
+		CruiseSpeed = 50,    -- studs/s, also the speed through the air. A trick takes ~1.3s whatever the speed, so
+		                     -- a lower speed needs less straight road per trick and tricks fit almost everywhere.
+		JumpVy = 70,         -- launch speed; airtime = 2*vy/g (auto-tuned)
+		MinVy = 45,          -- auto-tune floor
+		MaxVy = 120,         -- auto-tune ceiling
+		AutoTune = true,     -- find the lowest jump that still counts: lower after a streak, raise after a miss
 		Cooldown = 0.05,     -- seconds between landing and the next trick
 		TurnRate = 5,        -- rad/s steering
 		LandGap = 10,        -- ray length counted as grounded (the seat sits well above the road)
-		AutoRaise = true,    -- raise JumpVy when a flip does not register
 		AvoidObstacles = true,
 		Wheelie = true,      -- short wheelie before the flip
-		WheelieTime = 0.1,   -- seconds the wheelie is held
+		WheelieTime = 0.05,  -- seconds the wheelie is held
 		WheeliePitch = 35,   -- degrees the nose is raised to
 		MaxBend = 70,        -- degrees of route turning a trick may cover (the ride follows the route in the air)
 		MaxRouteDist = 250,  -- studs: nearest road must be closer than this
-		Loop = false,        -- false: ride the single straightest road back and forth; true: a loop through other roads
+		Bounce = false,      -- true: ride the straightest road back and forth instead of a circuit
 	},
-	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "-", gate = "-", road = "-" },
+	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "-", gate = "-", road = "-", startedAt = 0 },
 	Enabled = false,
 	Changed = nil,
 }
 
 local conns = {}
-local pts, idx, vdir = {}, 1, nil   -- route points, next point, our travel direction (flat unit vector)
-local loop, step, lo, hi = false, 1, 1, 1 -- loop route, or bounce between points lo..hi going `step` (+1/-1)
-local fwd, dir = 1, 1               -- which way the seat faces; spin direction (1 = nose up and back)
-local attempt, pending, pendingId = 0, false, 0
+local pts, idx, pidx, vdir = {}, 1, 1, nil -- route points, next point, previous point, our travel direction (flat unit)
+local loop, step, lo, hi = false, 1, 1, 1  -- loop: wraps hi -> lo. Bounce: reverses at lo / hi going `step` (+1/-1)
+local fwd, dir = 1, 1                      -- which way the seat faces; spin direction (1 = nose up and back)
+local attempt, pending, pendingId, streak = 0, false, 0, 0
 local lastEnd, lastIdxChange, blockedSince = 0, 0, nil
 local searching, retryAt, lastWhy = false, 0, nil
 local trick = nil
 local lastSeatTry = 0
-local roads -- { g = RoadGraph, k = intersection count, straight = ranked straight roads }
+local roads -- { g = RoadGraph, k = intersection count, data = raw road data, vecs = road polylines }
 
 local function changed() if Farm.Changed then Farm.Changed() end end
 local function status(s) if Farm.Stats.status ~= s then Farm.Stats.status = s; changed() end end
@@ -118,21 +121,27 @@ local function reseat()
 end
 
 -- route following ------------------------------------------------------------
--- loop: wraps around. Bounce: nil when the next point would leave the stretch lo..hi (the ride turns around there)
+-- loop: wraps hi -> lo (points before lo are the way in). Bounce: nil when the next point would leave lo..hi.
 local function nextIdx(i)
-	if loop then return (i % #pts) + 1 end
+	if loop then
+		if i >= hi then return lo end
+		return i + 1
+	end
 	local n = i + step
 	if n > hi or n < 1 then return nil end
-	if n < lo and i >= lo then return nil end -- leaving the road at its near end (points before lo are the way in)
+	if n < lo and i >= lo then return nil end
 	return n
 end
-local function prevIdx()
-	if loop then return ((idx - 2) % #pts) + 1 end
-	return math.clamp(idx - step, 1, #pts)
-end
+
 local function advance()
 	local n = nextIdx(idx)
-	if not n then step = -step; n = nextIdx(idx) end -- end of the road: turn around
+	if not n then -- bounce: end of the road, turn around
+		step = -step
+		pidx = idx
+		n = nextIdx(idx)
+	else
+		pidx = idx
+	end
 	idx = n or idx
 	lastIdxChange = os.clock()
 end
@@ -140,7 +149,7 @@ end
 -- pure pursuit: the point `L` studs ahead along the route from where we are on it. Steering at it keeps the
 -- ride on the road; the further off the line, the closer the aim point.
 local function pursuit(pos, L)
-	local a, b = flat(pts[prevIdx()]), flat(pts[idx])
+	local a, b = flat(pts[pidx]), flat(pts[idx])
 	local ab = b - a
 	local len2 = ab:Dot(ab)
 	local t = len2 > 0.01 and math.clamp(flat(pos - a):Dot(ab) / len2, 0, 1) or 1
@@ -163,7 +172,7 @@ end
 local function updateDirection(pos, dt)
 	local cfg = Farm.Config
 	for _ = 1, 80 do -- after a trick the ride is well past where idx points: skip ahead first
-		local a, b = flat(pts[prevIdx()]), flat(pts[idx])
+		local a, b = flat(pts[pidx]), flat(pts[idx])
 		local ab = b - a
 		local len2 = ab:Dot(ab)
 		if (len2 > 0.01 and flat(pos - a):Dot(ab) / len2 or 1) >= 1 then advance() else break end
@@ -201,7 +210,7 @@ local function bendAhead(pos, dist)
 	return total, walked
 end
 
--- roads: pick the loop with the most trickable (gentle) road ---------------------
+-- roads: build a circuit around the most trickable road ------------------------
 local function loadRoads()
 	if roads then return roads end
 	if not workspace:FindFirstChild("BezierRoads") then return nil, "no Workspace.BezierRoads" end
@@ -224,25 +233,10 @@ local function toVec(list)
 	return out
 end
 
--- longest stretch of a path that stays within ~14 degrees of its heading
-local function straightness(path)
-	local best, run, start = 0, 0, nil
-	for i = 2, #path do
-		local d = flat(path[i] - path[i - 1])
-		local len = d.Magnitude
-		if len > 0.5 then
-			d = d.Unit
-			if not start then
-				start, run = d, len
-			elseif start:Dot(d) > 0.97 then
-				run += len
-			else
-				best = math.max(best, run)
-				start, run = d, len
-			end
-		end
-	end
-	return math.max(best, run)
+local function pathLength(path)
+	local n = 0
+	for i = 2, #path do n += flat(path[i] - path[i - 1]).Magnitude end
+	return n
 end
 
 -- studs of the path from which a trick of length `run` fits (bend over the next `run` studs <= maxBend)
@@ -276,13 +270,13 @@ local function uturns(path)
 	return n
 end
 
--- fraction of `b` that runs along `a` (a loop that retraces its own road scores high)
+-- fraction of `b` that runs along `a` (a return path that retraces the road scores high)
 local function overlap(a, b)
 	local hit, total = 0, 0
 	for i = 1, #b, 2 do
 		total += 1
 		for j = 1, #a, 2 do
-			if flat(b[i] - a[j]).Magnitude < 10 then hit += 1 break end
+			if flat(b[i] - a[j]).Magnitude < 12 then hit += 1 break end
 		end
 	end
 	return total > 0 and hit / total or 0
@@ -295,128 +289,173 @@ local function runLength()
 	return run
 end
 
--- the single most trickable road near us, ridden back and forth. Returns the points and how to bounce on them.
-local function findStraightRoad(pos, R)
-	local cfg = Farm.Config
-	local g = R.g
-	local run, maxBend = runLength(), math.rad(cfg.MaxBend)
-	if not R.vecs then
-		R.vecs = {}
-		for _, road in ipairs(R.data.roads) do
-			local v = toVec(road.points)
-			if #v >= 3 then R.vecs[#R.vecs + 1] = v end
+local function prepRoads(R)
+	if R.vecs then return end
+	R.vecs = {}
+	for ri, road in ipairs(R.data.roads) do
+		local v = toVec(road.points)
+		if #v >= 3 then R.vecs[#R.vecs + 1] = { v = v, ri = ri } end
+	end
+end
+
+-- make the graph temporarily dislike road `ri`, so a route back avoids it. Graph points: intersections first,
+-- then each road's points in order. Returns a function that puts the weights back.
+local function penalizeRoad(R, ri, factor)
+	local edges = R.g.edges
+	local base = R.k
+	for q = 1, ri - 1 do base += #R.data.roads[q].points / 2 end
+	local n = #R.data.roads[ri].points / 2
+	local saved = {}
+	for i = base + 1, base + n - 1 do
+		local w = edges[i] and edges[i][i + 1]
+		if w then
+			saved[#saved + 1] = { i, w }
+			edges[i][i + 1] = w * factor
+			edges[i + 1][i] = w * factor
 		end
 	end
+	return function()
+		for _, r in ipairs(saved) do
+			edges[r[1]][r[1] + 1] = r[2]
+			edges[r[1] + 1][r[1]] = r[2]
+		end
+	end
+end
+
+local function leg(g, a, b)
+	local ok, path = pcall(function() return g:route(a, b) end)
+	if ok and path and #path >= 2 then return path end
+end
+
+-- ride the single most trickable road back and forth (fallback, or when Bounce is on)
+local function findBounce(pos, R)
+	local cfg = Farm.Config
+	prepRoads(R)
+	local run, maxBend = runLength(), math.rad(cfg.MaxBend)
 	local best, bestScore, bestJ, bestDist
-	for n, v in ipairs(R.vecs) do
-		if n % 8 == 0 then task.wait() end -- spread the search over a few frames
+	for n, r in ipairs(R.vecs) do
+		if n % 8 == 0 then task.wait() end
 		local j, dj = 1, math.huge
-		for i, p in ipairs(v) do
+		for i, p in ipairs(r.v) do
 			local d = flat(p - pos).Magnitude
 			if d < dj then j, dj = i, d end
 		end
 		if dj <= math.max(cfg.MaxRouteDist, 600) then
-			local score = trickable(v, run, maxBend) - dj * 0.5
-			if not bestScore or score > bestScore then best, bestScore, bestJ, bestDist = v, score, j, dj end
+			local score = trickable(r.v, run, maxBend) - dj * 0.5
+			if not bestScore or score > bestScore then best, bestScore, bestJ, bestDist = r.v, score, j, dj end
 		end
 	end
 	if not best or bestScore <= 0 then return nil, "no straight road near you" end
-
-	local meta = { loop = false, lo = 1, hi = #best }
+	local meta = { loop = false, lo = 1, hi = #best, label = ("Back and forth (%d studs)"):format(pathLength(best)) }
 	local path
 	if bestDist > 60 then
-		-- ride there along the roads first, then bounce on the straight one
-		local ok, leg = pcall(function() return g:route(pos, best[bestJ]) end)
-		if not (ok and leg and #leg >= 2) then return nil, "cannot reach the straight road" end
+		local e = leg(R.g, pos, best[bestJ])
+		if not e then return nil, "cannot reach the straight road" end
 		path = {}
-		for _, p in ipairs(leg) do path[#path + 1] = p end
+		for _, p in ipairs(e) do path[#path + 1] = p end
 		meta.lo = #path + 1
 		for _, p in ipairs(best) do path[#path + 1] = p end
-		meta.hi, meta.idx, meta.step = #path, 2, 1
+		meta.hi, meta.idx, meta.pidx, meta.step = #path, 2, 1, 1
 	else
 		path = best
-		-- start toward whichever end has more road ahead
 		local fwdLen, backLen = 0, 0
 		for i = bestJ, #best - 1 do fwdLen += flat(best[i + 1] - best[i]).Magnitude end
 		for i = 2, bestJ do backLen += flat(best[i] - best[i - 1]).Magnitude end
 		meta.step = fwdLen >= backLen and 1 or -1
 		meta.idx = math.clamp(bestJ + meta.step, 1, #best)
+		meta.pidx = bestJ
 	end
-	local length = 0
-	for i = 2, #best do length += flat(best[i] - best[i - 1]).Magnitude end
-	meta.label = ("Straight road (%d studs)"):format(length)
 	return path, meta
+end
+
+-- a circuit: out along a trickable road, back by a different way, round and round
+local function findCircuit(pos, R)
+	local cfg = Farm.Config
+	local g = R.g
+	prepRoads(R)
+	local run, maxBend = runLength(), math.rad(cfg.MaxBend)
+
+	local ranked = {}
+	for n, r in ipairs(R.vecs) do
+		if n % 16 == 0 then task.wait() end
+		local near = math.huge
+		for _, p in ipairs(r.v) do near = math.min(near, flat(p - pos).Magnitude) end
+		if near < 1500 then
+			local t = trickable(r.v, run, maxBend)
+			if t > 0 then ranked[#ranked + 1] = { r = r, t = t } end
+		end
+	end
+	table.sort(ranked, function(x, y) return x.t > y.t end)
+
+	local best, bestScore, bestDesc
+	for k = 1, math.min(10, #ranked) do
+		local r = ranked[k].r
+		for flip = 0, 1 do
+			task.wait() -- spread the search over a few frames
+			local v = r.v
+			if flip == 1 then
+				v = {}
+				for i = #r.v, 1, -1 do v[#v + 1] = r.v[i] end
+			end
+			local restore = penalizeRoad(R, r.ri, 60)
+			local back = leg(g, v[#v], v[1])
+			restore()
+			if back and overlap(v, back) < 0.3 then
+				local L = {}
+				for _, p in ipairs(v) do L[#L + 1] = p end
+				for i = 2, #back - 1 do L[#L + 1] = back[i] end -- the ends duplicate the road's own ends
+				local len = pathLength(L)
+				if len > 350 and uturns(L) == 0 then
+					local tr = trickable(L, run, maxBend)
+					local score = tr / len * 1000 + tr * 0.1
+					if not bestScore or score > bestScore then best, bestScore, bestDesc = L, score, { len = len, frac = tr / len } end
+				end
+			end
+		end
+	end
+	if not best then return nil, "no good circuit found" end
+
+	-- join the circuit: start at the point nearest to us, riding there along the roads first if it is far
+	local j, dj = 1, math.huge
+	for i, p in ipairs(best) do
+		local d = flat(p - pos).Magnitude
+		if d < dj then j, dj = i, d end
+	end
+	local entry = {}
+	if dj > 60 then
+		local e = leg(g, pos, best[j])
+		if not e then return nil, "cannot reach the circuit" end
+		for i = 1, #e - 1 do entry[#entry + 1] = e[i] end
+	end
+	local path = {}
+	for _, p in ipairs(entry) do path[#path + 1] = p end
+	for i = 0, #best - 1 do path[#path + 1] = best[((j - 1 + i) % #best) + 1] end -- circuit rotated to start at j
+	return path, {
+		loop = true, lo = #entry + 1, hi = #path, idx = math.min(2, #path), pidx = 1,
+		label = ("Circuit (%d studs, %d%% trickable)"):format(bestDesc.len, bestDesc.frac * 100),
+	}
 end
 
 -- runs in its own thread (yields between candidates so the game never hitches)
 local function findRoute(pos)
 	local R, why = loadRoads()
 	if not R then return nil, why end
-	local g = R.g
-	local near = g:closest(pos)
+	local near = R.g:closest(pos)
 	if not near then return nil, "no road found" end
 	if near.distance > Farm.Config.MaxRouteDist then
 		return nil, ("nearest road is %d studs away"):format(near.distance)
 	end
-	if not Farm.Config.Loop then return findStraightRoad(pos, R) end
-
-	if not R.straight then -- rank every road by its longest straight stretch, once
-		local list = {}
-		for _, road in ipairs(R.data.roads) do
-			local v = toVec(road.points)
-			if #v >= 3 then list[#list + 1] = { a = v[1], b = v[#v], run = straightness(v) } end
-		end
-		table.sort(list, function(x, y) return x.run > y.run end)
-		R.straight = list
+	if not Farm.Config.Bounce then
+		local path, meta = findCircuit(pos, R)
+		if path then return path, meta end
 	end
-
-	local here = flat(pos)
-	local cands = {}
-	for _, r in ipairs(R.straight) do
-		if math.min(flat(r.a - pos).Magnitude, flat(r.b - pos).Magnitude) < 1500 then
-			cands[#cands + 1] = r
-			if #cands >= 12 then break end
-		end
-	end
-	if #cands == 0 then return nil, "no straight roads near you" end
-
-	local function leg(a, b)
-		local ok, path = pcall(function() return g:route(a, b) end)
-		if ok and path and #path >= 2 then return path end
-	end
-
-	local run, maxBend = runLength(), math.rad(Farm.Config.MaxBend)
-	local best, bestScore
-	for _, r in ipairs(cands) do
-		for flip = 0, 1 do
-			task.wait() -- spread the search over a few frames
-			local A, B = r.a, r.b
-			if flip == 1 then A, B = B, A end
-			local l1, l2, l3 = leg(pos, A), leg(A, B), leg(B, pos)
-			if l1 and l2 and l3 then
-				local path, length = {}, 0
-				for _, l in ipairs({ l1, l2, l3 }) do
-					for i, p in ipairs(l) do
-						if not (#path > 0 and i == 1) then -- legs share their joint point
-							if #path > 0 then length += flat(p - path[#path]).Magnitude end
-							path[#path + 1] = p
-						end
-					end
-				end
-				local score = trickable(path, run, maxBend)
-					- overlap(l1, l3) * 3000 - overlap(l1, l2) * 1500 - uturns(path) * 4000
-				if length > 400 and (not bestScore or score > bestScore) then best, bestScore = path, score end
-			end
-		end
-	end
-	if not best then return nil, "no good road loop found" end
-	return best, { loop = true, idx = 2, label = "Road loop" }
+	return findBounce(pos, R)
 end
 
 local function startSearch(s)
 	if searching or os.clock() < retryAt then return end
 	searching = true
-	status("Finding the straightest route...")
+	status("Finding the best route...")
 	local pos = s.Position
 	task.spawn(function()
 		local path, second = findRoute(pos)
@@ -424,7 +463,7 @@ local function startSearch(s)
 		local meta = type(second) == "table" and second or {}
 		searching = false
 		if path and Farm.Enabled then
-			pts, idx, vdir = path, meta.idx or 2, nil
+			pts, idx, pidx, vdir = path, meta.idx or 2, meta.pidx or 1, nil
 			loop, step, lo, hi = meta.loop == true, meta.step or 1, meta.lo or 1, meta.hi or #path
 			lastIdxChange = os.clock()
 			Farm.Stats.mode = meta.label or "Road"
@@ -454,8 +493,10 @@ local function finishTrick()
 		task.delay(6, function() -- the server reports "landed"; if it never does, count a miss
 			if pending and pendingId == id then
 				pending = false
+				local cfg = Farm.Config
 				Farm.Stats.fails += 1
-				if Farm.Config.AutoRaise then Farm.Config.JumpVy = math.min(Farm.Config.JumpVy + 5, Farm.Config.MaxVy) end
+				streak = 0
+				if cfg.AutoTune then cfg.JumpVy = math.min(cfg.JumpVy + 10, cfg.MaxVy) end
 				status("Missed, retrying")
 			end
 		end)
@@ -625,12 +666,17 @@ task.spawn(function()
 	table.insert(conns, ev.OnClientEvent:Connect(function(state, name, cash)
 		if state ~= "landed" then return end
 		pending = false
-		local S = Farm.Stats
+		local S, cfg = Farm.Stats, Farm.Config
 		if name == "Front Flip" then dir = -dir; S.direction = dir == 1 and "Back" or "Front" end -- spun the wrong way
 		if name == "Backflip" or name == "Front Flip" then
 			S.earned += cash or 0
 			S.flips += 1
 			S.last = ("%s +$%s"):format(name, tostring(cash))
+			streak += 1
+			if cfg.AutoTune and streak >= 6 then -- a clean streak: try a lower, faster jump
+				cfg.JumpVy = math.max(cfg.JumpVy - 5, cfg.MinVy)
+				streak = 0
+			end
 		end
 		changed()
 	end))
@@ -648,6 +694,7 @@ function Farm:SetEnabled(v)
 			if vel.Magnitude > 5 and look.Magnitude > 0.05 then fwd = vel:Dot(look) >= 0 and 1 or -1 end
 		end
 		lastEnd = 0
+		if self.Stats.startedAt == 0 then self.Stats.startedAt = os.clock() end
 	end
 	self.Enabled = v
 	status(v and (seat() and "Riding" or "Get on your ride") or "Idle")
@@ -666,7 +713,9 @@ function Farm:FlipDirection() dir = -dir; self.Stats.direction = dir == 1 and "B
 function Farm:FlipForward() fwd = -fwd; vdir = nil end
 
 function Farm:Reset()
-	self.Stats.earned, self.Stats.flips, self.Stats.fails, self.Stats.last = 0, 0, 0, "-"
+	local S = self.Stats
+	S.earned, S.flips, S.fails, S.last = 0, 0, 0, "-"
+	S.startedAt = self.Enabled and os.clock() or 0
 	changed()
 end
 

@@ -22,20 +22,21 @@ tFarm:Toggle({ Name = "Autofarm", Default = false, Callback = function(v)
 end })
 tFarm:Slider({ Name = "Ride speed", Min = 15, Max = 120, Step = 1, Default = cfg.CruiseSpeed, Suffix = " st/s", Callback = function(v) cfg.CruiseSpeed = v end })
 local jump = tFarm:Slider({ Name = "Jump power", Min = 30, Max = 140, Step = 5, Default = cfg.JumpVy, Callback = function(v) cfg.JumpVy = v end })
-tFarm:Slider({ Name = "Max jump power", Min = 40, Max = 140, Step = 5, Default = cfg.MaxVy, Callback = function(v) cfg.MaxVy = v end })
+tFarm:Slider({ Name = "Min jump power (auto-tune)", Min = 30, Max = 100, Step = 5, Default = cfg.MinVy, Callback = function(v) cfg.MinVy = v end })
+tFarm:Slider({ Name = "Max jump power (auto-tune)", Min = 40, Max = 140, Step = 5, Default = cfg.MaxVy, Callback = function(v) cfg.MaxVy = v end })
 tFarm:Slider({ Name = "Cooldown", Min = 0, Max = 2, Step = 0.05, Default = cfg.Cooldown, Suffix = " s", Callback = function(v) cfg.Cooldown = v end })
 tFarm:Toggle({ Name = "Wheelie before flip", Default = cfg.Wheelie, Callback = function(v) cfg.Wheelie = v end })
 tFarm:Slider({ Name = "Wheelie hold time", Min = 0, Max = 2, Step = 0.05, Default = cfg.WheelieTime, Suffix = " s", Callback = function(v) cfg.WheelieTime = v end })
 tFarm:Slider({ Name = "Wheelie angle", Min = 20, Max = 70, Step = 5, Default = cfg.WheeliePitch, Suffix = " deg", Callback = function(v) cfg.WheeliePitch = v end })
-tFarm:Toggle({ Name = "Auto-raise jump on miss", Default = cfg.AutoRaise, Callback = function(v) cfg.AutoRaise = v end })
+tFarm:Toggle({ Name = "Auto-tune jump power", Default = cfg.AutoTune, Callback = function(v) cfg.AutoTune = v end })
 
 -- Route tab
 local tRoute = win:Tab("Route")
 local lMode = tRoute:Label({ Name = "Route mode" })
 local lPts = tRoute:Label({ Name = "Route points" })
 local lRoad = tRoute:Label({ Name = "Road status" })
-tRoute:Toggle({ Name = "Loop through other roads (off: best straight road)", Default = cfg.Loop, Callback = function(v)
-	cfg.Loop = v
+tRoute:Toggle({ Name = "Back and forth on one road (off: circuit)", Default = cfg.Bounce, Callback = function(v)
+	cfg.Bounce = v
 	Farm:RebuildPath()
 end })
 tRoute:Button({ Name = "Pick a new road route", Callback = function() Farm:RebuildPath() end })
@@ -60,6 +61,7 @@ local lLast = tStats:Label({ Name = "Last trick" })
 local lGate = tStats:Label({ Name = "Next flip" })
 local lDir = tStats:Label({ Name = "Spin direction" })
 local lPower = tStats:Label({ Name = "Current jump power" })
+local lRate = tStats:Label({ Name = "Income" })
 tStats:Button({ Name = "Reset stats", Callback = function() Farm:Reset() end })
 
 local function refresh()
@@ -74,6 +76,8 @@ local function refresh()
 	lGate:Set(stats.gate)
 	lDir:Set(stats.direction)
 	lPower:Set(cfg.JumpVy)
+	local mins = stats.startedAt > 0 and math.max(1 / 60, (os.clock() - stats.startedAt) / 60) or 0
+	lRate:Set(mins > 0 and ("$" .. math.floor(stats.earned / mins) .. "/min") or "-")
 	jump:Set(cfg.JumpVy, true) -- keep the slider in sync with auto-raise
 end
 Farm.Changed = refresh
