@@ -23,6 +23,7 @@ local Farm = {
 		WheeliePitch = 35,   -- degrees the nose is raised to
 		MaxBend = 70,        -- degrees of route turning a trick may cover (the ride follows the route in the air)
 		MaxRouteDist = 250,  -- studs: nearest road must be closer than this
+		Loop = false,        -- false: ride the single straightest road back and forth; true: a loop through other roads
 	},
 	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "-", gate = "-", road = "-" },
 	Enabled = false,
@@ -31,6 +32,7 @@ local Farm = {
 
 local conns = {}
 local pts, idx, vdir = {}, 1, nil   -- route points, next point, our travel direction (flat unit vector)
+local loop, step, lo, hi = false, 1, 1, 1 -- loop route, or bounce between points lo..hi going `step` (+1/-1)
 local fwd, dir = 1, 1               -- which way the seat faces; spin direction (1 = nose up and back)
 local attempt, pending, pendingId = 0, false, 0
 local lastEnd, lastIdxChange, blockedSince = 0, 0, nil
@@ -116,9 +118,24 @@ local function reseat()
 end
 
 -- route following ------------------------------------------------------------
-local function nextIdx(i) return (i % #pts) + 1 end
-local function prevIdx() return ((idx - 2) % #pts) + 1 end
-local function advance() idx = nextIdx(idx); lastIdxChange = os.clock() end
+-- loop: wraps around. Bounce: nil when the next point would leave the stretch lo..hi (the ride turns around there)
+local function nextIdx(i)
+	if loop then return (i % #pts) + 1 end
+	local n = i + step
+	if n > hi or n < 1 then return nil end
+	if n < lo and i >= lo then return nil end -- leaving the road at its near end (points before lo are the way in)
+	return n
+end
+local function prevIdx()
+	if loop then return ((idx - 2) % #pts) + 1 end
+	return math.clamp(idx - step, 1, #pts)
+end
+local function advance()
+	local n = nextIdx(idx)
+	if not n then step = -step; n = nextIdx(idx) end -- end of the road: turn around
+	idx = n or idx
+	lastIdxChange = os.clock()
+end
 
 -- pure pursuit: the point `L` studs ahead along the route from where we are on it. Steering at it keeps the
 -- ride on the road; the further off the line, the closer the aim point.
@@ -135,7 +152,9 @@ local function pursuit(pos, L)
 		if d >= rem then return cur + (d > 0.01 and seg.Unit * rem or Vector3.zero), t end
 		rem -= d
 		cur = flat(pts[i])
-		i = nextIdx(i)
+		local n = nextIdx(i)
+		if not n then return cur, t end
+		i = n
 	end
 	return cur, t
 end
@@ -175,7 +194,9 @@ local function bendAhead(pos, dist)
 			if walked >= dist then break end
 		end
 		cur = pts[i]
-		i = nextIdx(i)
+		local n = nextIdx(i)
+		if not n then break end
+		i = n
 	end
 	return total, walked
 end
@@ -274,6 +295,59 @@ local function runLength()
 	return run
 end
 
+-- the single most trickable road near us, ridden back and forth. Returns the points and how to bounce on them.
+local function findStraightRoad(pos, R)
+	local cfg = Farm.Config
+	local g = R.g
+	local run, maxBend = runLength(), math.rad(cfg.MaxBend)
+	if not R.vecs then
+		R.vecs = {}
+		for _, road in ipairs(R.data.roads) do
+			local v = toVec(road.points)
+			if #v >= 3 then R.vecs[#R.vecs + 1] = v end
+		end
+	end
+	local best, bestScore, bestJ, bestDist
+	for n, v in ipairs(R.vecs) do
+		if n % 8 == 0 then task.wait() end -- spread the search over a few frames
+		local j, dj = 1, math.huge
+		for i, p in ipairs(v) do
+			local d = flat(p - pos).Magnitude
+			if d < dj then j, dj = i, d end
+		end
+		if dj <= math.max(cfg.MaxRouteDist, 600) then
+			local score = trickable(v, run, maxBend) - dj * 0.5
+			if not bestScore or score > bestScore then best, bestScore, bestJ, bestDist = v, score, j, dj end
+		end
+	end
+	if not best or bestScore <= 0 then return nil, "no straight road near you" end
+
+	local meta = { loop = false, lo = 1, hi = #best }
+	local path
+	if bestDist > 60 then
+		-- ride there along the roads first, then bounce on the straight one
+		local ok, leg = pcall(function() return g:route(pos, best[bestJ]) end)
+		if not (ok and leg and #leg >= 2) then return nil, "cannot reach the straight road" end
+		path = {}
+		for _, p in ipairs(leg) do path[#path + 1] = p end
+		meta.lo = #path + 1
+		for _, p in ipairs(best) do path[#path + 1] = p end
+		meta.hi, meta.idx, meta.step = #path, 2, 1
+	else
+		path = best
+		-- start toward whichever end has more road ahead
+		local fwdLen, backLen = 0, 0
+		for i = bestJ, #best - 1 do fwdLen += flat(best[i + 1] - best[i]).Magnitude end
+		for i = 2, bestJ do backLen += flat(best[i] - best[i - 1]).Magnitude end
+		meta.step = fwdLen >= backLen and 1 or -1
+		meta.idx = math.clamp(bestJ + meta.step, 1, #best)
+	end
+	local length = 0
+	for i = 2, #best do length += flat(best[i] - best[i - 1]).Magnitude end
+	meta.label = ("Straight road (%d studs)"):format(length)
+	return path, meta
+end
+
 -- runs in its own thread (yields between candidates so the game never hitches)
 local function findRoute(pos)
 	local R, why = loadRoads()
@@ -284,6 +358,7 @@ local function findRoute(pos)
 	if near.distance > Farm.Config.MaxRouteDist then
 		return nil, ("nearest road is %d studs away"):format(near.distance)
 	end
+	if not Farm.Config.Loop then return findStraightRoad(pos, R) end
 
 	if not R.straight then -- rank every road by its longest straight stretch, once
 		local list = {}
@@ -335,7 +410,7 @@ local function findRoute(pos)
 		end
 	end
 	if not best then return nil, "no good road loop found" end
-	return best
+	return best, { loop = true, idx = 2, label = "Road loop" }
 end
 
 local function startSearch(s)
@@ -344,12 +419,15 @@ local function startSearch(s)
 	status("Finding the straightest route...")
 	local pos = s.Position
 	task.spawn(function()
-		local path, why = findRoute(pos)
+		local path, second = findRoute(pos)
+		local why = type(second) == "string" and second or nil
+		local meta = type(second) == "table" and second or {}
 		searching = false
 		if path and Farm.Enabled then
-			pts, idx, vdir = path, 2, nil
+			pts, idx, vdir = path, meta.idx or 2, nil
+			loop, step, lo, hi = meta.loop == true, meta.step or 1, meta.lo or 1, meta.hi or #path
 			lastIdxChange = os.clock()
-			Farm.Stats.mode = "Road loop"
+			Farm.Stats.mode = meta.label or "Road"
 			Farm.Stats.points = #path
 			Farm.Stats.road = "ok"
 			status("Riding")
@@ -521,7 +599,8 @@ local function stepRide(s, dt)
 	elseif not grounded(s) then gate = "not grounded"
 	else
 		local bend, walked = bendAhead(pos, run + 10)
-		if bend > math.rad(cfg.MaxBend) then gate = "corner ahead, waiting" end
+		if walked < run + 10 then gate = "end of road, turning around"
+		elseif bend > math.rad(cfg.MaxBend) then gate = "corner ahead, waiting" end
 	end
 	if Farm.Stats.gate ~= (gate or "go") then Farm.Stats.gate = gate or "go"; changed() end
 	if not gate then startTrick(s) end
