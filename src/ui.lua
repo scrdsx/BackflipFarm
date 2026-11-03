@@ -143,7 +143,8 @@ function UI.new(opts)
 
 	-- sidebar
 	local side = new("Frame", { Position = UDim2.fromOffset(0, 52), Size = UDim2.new(0, 150, 1, -52), BackgroundColor3 = T.panel, BorderSizePixel = 0, Parent = root })
-	new("Frame", { Size = UDim2.new(0, 1, 1, 0), Position = UDim2.new(1, -1, 0, 0), BackgroundColor3 = T.stroke, BorderSizePixel = 0, Parent = side })
+	-- divider lives on root: inside side, its UIListLayout would give it the whole column and push the tabs away
+	new("Frame", { Size = UDim2.new(0, 1, 1, -52), Position = UDim2.fromOffset(149, 52), BackgroundColor3 = T.stroke, BorderSizePixel = 0, Parent = root })
 	new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = side })
 	new("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 12), Parent = side })
 	self.side = side

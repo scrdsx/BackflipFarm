@@ -38,5 +38,5 @@ getgenv().ScrdsxLocal = "BackflipFarm/"
 loadstring(readfile("BackflipFarm/loader.lua"))()
 ```
 
-Keys: RightShift hide/show, F6 toggle farm, `/` focus search.
+Keys: RightShift hide/show, `/` focus search.
 Untested in game: written from the clipboard dump only.
