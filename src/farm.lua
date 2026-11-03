@@ -28,6 +28,7 @@ local Farm = {
 		WheeliePitch = 40,   -- degrees the nose is held at
 		LoopRoute = true,    -- loop when the route's ends meet, otherwise ride it back and forth
 		MaxRouteDist = 250,  -- refuse to drive if the route is farther than this from you
+		RoadHalfWidth = 14,  -- studs from the road centreline still counted as on the road
 		UseRoads = true,     -- build the route from the game's road network (no recording needed)
 	},
 	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle", gate = "-", road = "-" },
@@ -43,6 +44,7 @@ local pts, idx, step, fwd, loop = {}, 1, 1, 1, false
 local distSince, lastPos, blockedSince, lastRec, pathRetry = 0, nil, nil, nil, 0
 local flipConn
 local searching = false
+local roadMode, lastIdxChange = false, 0
 
 local function changed() if Farm.Changed then Farm.Changed() end end
 local function status(s) if Farm.Stats.status ~= s then Farm.Stats.status = s; changed() end end
@@ -130,6 +132,7 @@ local function advance()
 	local n = nextIdx(idx)
 	if not n then step = -step; n = idx + step end
 	idx = math.clamp(n, 1, #pts)
+	lastIdxChange = os.clock()
 end
 
 -- walk the route ahead of `pos` for `dist` studs: the point reached, distance walked, and whether the route ended first
@@ -183,7 +186,30 @@ local function straightness(path)
 	return math.max(best, run)
 end
 
--- a long loop on the roads: start -> A -> B -> start, picked for long straight stretches
+-- number of sharp reversals along a path (a U-turn means the route doubles back)
+local function uturns(path)
+	local n = 0
+	for i = 3, #path do
+		local a, b = flat(path[i - 1] - path[i - 2]), flat(path[i] - path[i - 1])
+		if a.Magnitude > 1 and b.Magnitude > 1 and a.Unit:Dot(b.Unit) < -0.5 then n += 1 end
+	end
+	return n
+end
+
+-- fraction of `b` that runs along `a` (sampled): a loop that retraces its own road scores high
+local function overlap(a, b)
+	local hit, total = 0, 0
+	for i = 1, #b, 2 do
+		total += 1
+		for j = 1, #a, 2 do
+			if flat(b[i] - a[j]).Magnitude < 10 then hit += 1 break end
+		end
+	end
+	return total > 0 and hit / total or 0
+end
+
+-- a long loop on the roads: start -> A -> B -> start. Rejects routes that double back or retrace
+-- themselves, and prefers long ones with long straight stretches.
 local function roadPath(pos)
 	local g, why = getRoads()
 	if not g then return nil, why end
@@ -205,7 +231,7 @@ local function roadPath(pos)
 		if ok and path and #path >= 2 then return path end
 	end
 	local best, bestScore
-	for _ = 1, 10 do
+	for _ = 1, 24 do
 		task.wait() -- spread the search over a few frames
 		local A, B = cands[math.random(#cands)], cands[math.random(#cands)]
 		if (A - B).Magnitude > 250 then
@@ -221,11 +247,12 @@ local function roadPath(pos)
 					end
 				end
 				local score = straightness(path) + length * 0.05
-				if not bestScore or score > bestScore then best, bestScore = path, score end
+					- overlap(l1, l3) * 3000 - overlap(l1, l2) * 1500 - uturns(path) * 4000
+				if length > 600 and (not bestScore or score > bestScore) then best, bestScore = path, score end
 			end
 		end
 	end
-	if not best then return nil, "no road loop found" end
+	if not best then return nil, "no good road loop found, try again" end
 	return best
 end
 
@@ -239,6 +266,7 @@ local function buildPath(s)
 			Farm.Stats.mode = "Road loop (" .. #pts .. " pts)"
 			Farm.Stats.points = #pts
 			Farm.Stats.road = "ok"
+			roadMode = true
 			changed()
 			return true
 		end
@@ -248,6 +276,7 @@ local function buildPath(s)
 		status("Road route failed (see Route tab)")
 		return false
 	end
+	roadMode = false
 	local n = #Farm.Route
 	if n >= 2 then
 		local best, bd = 1, math.huge
@@ -434,7 +463,7 @@ local function pursuit(pos, L)
 	local len2 = ab:Dot(ab)
 	local t = len2 > 0.01 and math.clamp(flat(pos - a):Dot(ab) / len2, 0, 1) or 1
 	local cur = a + ab * t
-	local rem, i = L, idx
+	local rem, i = math.max(10, L - flat(pos - cur).Magnitude * 1.2), idx -- off the line: aim closer
 	for _ = 1, #pts + 2 do
 		local seg = flat(pts[i]) - cur
 		local d = seg.Magnitude
@@ -451,6 +480,12 @@ end
 local function drive(s, dt)
 	local cfg = Farm.Config
 	local pos = s.Position
+	if os.clock() - lastIdxChange > 8 then -- no progress along the route: circling or stuck
+		lastIdxChange = os.clock()
+		pts = {}
+		status("Stuck, picking a new route")
+		return
+	end
 	local target, along = pursuit(pos, math.clamp(cfg.CruiseSpeed * 0.8, 15, 60))
 	if along >= 0.999 or flat(pts[idx] - pos).Magnitude < 6 then advance() end
 	local to = flat(target - pos)
@@ -508,9 +543,18 @@ local function drive(s, dt)
 	elseif cfg.AvoidObstacles and blocked(s, nf, run + 10) then gate = "obstacle ahead"
 	end
 	if not gate then
-		local pt, walked, atEnd = lookahead(pos, run + 12)
-		if atEnd and walked < run + 12 then gate = "end of route too close"
-		elseif flat(pt - pos).Magnitude < walked * 0.9 then gate = "curve ahead" end
+		if roadMode and roadCache then
+			-- every point of the straight run (and the landing) must be on the road, else wait for a better spot
+			local d = 8
+			while d <= run + 10 do
+				if not roadCache:nearest(pos + nf * d, cfg.RoadHalfWidth) then gate = "off-road ahead, waiting"; break end
+				d += 8
+			end
+		else
+			local pt, walked, atEnd = lookahead(pos, run + 12)
+			if atEnd and walked < run + 12 then gate = "end of route too close"
+			elseif flat(pt - pos).Magnitude < walked * 0.9 then gate = "curve ahead" end
+		end
 	end
 	if Farm.Stats.gate ~= (gate or "go") then Farm.Stats.gate = gate or "go"; changed() end
 	if not gate then startTrick(s, nf) end
@@ -536,6 +580,7 @@ table.insert(conns, STEP:Connect(function(dt)
 		status("Finding route...")
 		task.spawn(function()
 			local ok = buildPath(s)
+			if ok then lastIdxChange = os.clock() end
 			searching = false
 			if not ok then pathRetry = os.clock() + 2 end
 		end)
