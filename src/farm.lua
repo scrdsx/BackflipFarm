@@ -28,7 +28,7 @@ local Farm = {
 		WheeliePitch = 40,   -- degrees the nose is held at
 		LoopRoute = true,    -- loop when the route's ends meet, otherwise ride it back and forth
 		MaxRouteDist = 250,  -- refuse to drive if the route is farther than this from you
-		RoadHalfWidth = 14,  -- studs from the road centreline still counted as on the road
+		MaxBend = 70,        -- degrees of turning allowed in the stretch a trick covers (it follows the route)
 		UseRoads = true,     -- build the route from the game's road network (no recording needed)
 	},
 	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle", gate = "-", road = "-" },
@@ -356,6 +356,78 @@ local function endTrick(restore)
 	lastEnd, distSince, lastPos = os.clock(), 0, nil
 end
 
+-- route following (shared by riding and by tricks, so the ride keeps following the road through the air) -----
+local function prevIdx()
+	if loop then return ((idx - 2) % #pts) + 1 end
+	return math.clamp(idx - step, 1, #pts)
+end
+
+-- pure pursuit: the point `L` studs ahead along the path, measured from where we are on it.
+-- Steering at that point keeps the ride on the road instead of cutting corners between points.
+local function pursuit(pos, L)
+	local a, b = flat(pts[prevIdx()]), flat(pts[idx])
+	local ab = b - a
+	local len2 = ab:Dot(ab)
+	local t = len2 > 0.01 and math.clamp(flat(pos - a):Dot(ab) / len2, 0, 1) or 1
+	local cur = a + ab * t
+	local rem, i = math.max(10, L - flat(pos - cur).Magnitude * 1.2), idx -- off the line: aim closer
+	for _ = 1, #pts + 2 do
+		local seg = flat(pts[i]) - cur
+		local d = seg.Magnitude
+		if d >= rem then return cur + (d > 0.01 and seg.Unit * rem or Vector3.zero), t end
+		rem -= d
+		cur = flat(pts[i])
+		local n = nextIdx(i)
+		if not n then return cur, t end
+		i = n
+	end
+	return cur, t
+end
+
+-- move along the route and turn our travel direction (vdir) toward it at a limited rate.
+-- Returns the heading error, or nil if there is nothing to steer at yet.
+local function updateDirection(pos, dt)
+	local cfg = Farm.Config
+	for _ = 1, 80 do -- after a trick the ride is well past where idx points: skip ahead first
+		local a, b = flat(pts[prevIdx()]), flat(pts[idx])
+		local ab = b - a
+		local len2 = ab:Dot(ab)
+		if (len2 > 0.01 and flat(pos - a):Dot(ab) / len2 or 1) >= 1 then advance() else break end
+	end
+	local target, along = pursuit(pos, math.clamp(cfg.CruiseSpeed * 0.8, 15, 60))
+	if along >= 0.999 or flat(pts[idx] - pos).Magnitude < 6 then advance() end
+	local to = flat(target - pos)
+	if to.Magnitude < 1 or not vdir then return nil end
+	local want = to.Unit
+	local ang = math.atan2(vdir:Cross(want).Y, vdir:Dot(want))
+	local rot = math.clamp(ang * math.min(1, dt * 8), -cfg.TurnRate * dt, cfg.TurnRate * dt)
+	vdir = (CFrame.Angles(0, rot, 0) * vdir).Unit
+	return ang
+end
+
+-- total turning along the next `dist` studs of route: gentle bends are fine for a trick (it follows the
+-- route in the air), a sharp corner is not. Returns bend (radians), whether the route ended first, distance walked.
+local function bendAhead(pos, dist)
+	local cur, walked, i = pos, 0, idx
+	local prev, total = vdir, 0
+	for _ = 1, #pts + 2 do
+		local seg = flat(pts[i] - cur)
+		local len = seg.Magnitude
+		if len > 0.5 then
+			local d = seg.Unit
+			if prev then total += math.acos(math.clamp(prev:Dot(d), -1, 1)) end
+			prev = d
+			walked += len
+			if walked >= dist then break end
+		end
+		cur = pts[i]
+		local n = nextIdx(i)
+		if not n then return total, true, walked end
+		i = n
+	end
+	return total, false, walked
+end
+
 -- backflip: jump + spin at full ride speed, hold the ride level until it lands
 local function backflip(s, ahead, restoreIn)
 	local cfg = Farm.Config
@@ -381,10 +453,14 @@ local function backflip(s, ahead, restoreIn)
 			return
 		end
 		t += dt
+		if #pts > 0 and vdir then updateDirection(s.Position, dt) end
+		local d = vdir or ahead
+		local vv = s.AssemblyLinearVelocity
+		s.AssemblyLinearVelocity = Vector3.new(d.X * cfg.CruiseSpeed, vv.Y, d.Z * cfg.CruiseSpeed) -- follow the route through the air
 		if landUntil then
 			-- landing assist: keep the ride level until it touches down
 			s.AssemblyAngularVelocity = Vector3.zero
-			s.CFrame = CFrame.lookAt(s.Position, s.Position + ahead * fwd)
+			s.CFrame = CFrame.lookAt(s.Position, s.Position + (vdir or ahead) * fwd)
 			if os.clock() > landUntil then
 				flipConn:Disconnect()
 				endTrick(restore)
@@ -439,11 +515,13 @@ local function wheelieThenFlip(s, ahead)
 		local err = target * math.min(t / 0.25, 1) - pitch
 		s.AssemblyAngularVelocity = s.CFrame.RightVector * dir * math.clamp(err * 10, -5, 5)
 		local v = s.AssemblyLinearVelocity
-		s.AssemblyLinearVelocity = Vector3.new(hv.X, v.Y, hv.Z) -- keep the ride speed
+		if #pts > 0 and vdir then updateDirection(s.Position, dt) end
+		local d = vdir or ahead
+		s.AssemblyLinearVelocity = Vector3.new(d.X * cfg.CruiseSpeed, v.Y, d.Z * cfg.CruiseSpeed) -- keep the ride speed, along the route
 		if pitch > math.rad(80) then -- going over: abort, level out
 			flipConn:Disconnect()
 			s.AssemblyAngularVelocity = Vector3.zero
-			s.CFrame = CFrame.lookAt(s.Position, s.Position + ahead * fwd)
+			s.CFrame = CFrame.lookAt(s.Position, s.Position + (vdir or ahead) * fwd)
 			endTrick(restore)
 			status("Wheelie too steep, aborted")
 			return
@@ -457,37 +535,11 @@ local function wheelieThenFlip(s, ahead)
 end
 
 local function startTrick(s, ahead)
+	vdir = vdir or ahead
 	if Farm.Config.Wheelie then wheelieThenFlip(s, ahead) else backflip(s, ahead) end
 end
 
 -- driving --------------------------------------------------------------------
-local function prevIdx()
-	if loop then return ((idx - 2) % #pts) + 1 end
-	return math.clamp(idx - step, 1, #pts)
-end
-
--- pure pursuit: the point `L` studs ahead along the path, measured from where we are on it.
--- Steering at that point keeps the ride on the road instead of cutting corners between points.
-local function pursuit(pos, L)
-	local a, b = flat(pts[prevIdx()]), flat(pts[idx])
-	local ab = b - a
-	local len2 = ab:Dot(ab)
-	local t = len2 > 0.01 and math.clamp(flat(pos - a):Dot(ab) / len2, 0, 1) or 1
-	local cur = a + ab * t
-	local rem, i = math.max(10, L - flat(pos - cur).Magnitude * 1.2), idx -- off the line: aim closer
-	for _ = 1, #pts + 2 do
-		local seg = flat(pts[i]) - cur
-		local d = seg.Magnitude
-		if d >= rem then return cur + (d > 0.01 and seg.Unit * rem or Vector3.zero), t end
-		rem -= d
-		cur = flat(pts[i])
-		local n = nextIdx(i)
-		if not n then return cur, t end
-		i = n
-	end
-	return cur, t
-end
-
 local function drive(s, dt)
 	local cfg = Farm.Config
 	local pos = s.Position
@@ -497,28 +549,15 @@ local function drive(s, dt)
 		status("Stuck, picking a new route")
 		return
 	end
-	for _ = 1, 80 do
-		local a, b = flat(pts[prevIdx()]), flat(pts[idx])
-		local ab = b - a
-		local len2 = ab:Dot(ab)
-		if (len2 > 0.01 and flat(pos - a):Dot(ab) / len2 or 1) >= 1 then advance() else break end
-	end
-	local target, along = pursuit(pos, math.clamp(cfg.CruiseSpeed * 0.8, 15, 60))
-	if along >= 0.999 or flat(pts[idx] - pos).Magnitude < 6 then advance() end
-	local to = flat(target - pos)
-	if to.Magnitude < 1 then return end
-	local want = to.Unit
-
 	if not vdir then
 		local f0 = flat(s.CFrame.LookVector) * fwd
 		if f0.Magnitude < 0.05 then return end
 		vdir = f0.Unit
 	end
-	-- turn our travel direction toward the route at a limited rate; the ride then faces it and moves along it,
-	-- so it always heads for the route instead of depending on how the physics happens to rotate it
-	local ang = math.atan2(vdir:Cross(want).Y, vdir:Dot(want))
-	local rot = math.clamp(ang * math.min(1, dt * 8), -cfg.TurnRate * dt, cfg.TurnRate * dt)
-	vdir = (CFrame.Angles(0, rot, 0) * vdir).Unit
+	local ang = updateDirection(pos, dt)
+	if not ang then return end
+
+	-- face the ride along its direction of travel (yaw only; pitch and roll are left alone)
 	local cf = s.CFrame
 	local look = flat(cf.LookVector) * fwd
 	if look.Magnitude > 0.05 then
@@ -555,29 +594,19 @@ local function drive(s, dt)
 	if lastPos then distSince += flat(pos - lastPos).Magnitude end
 	lastPos = pos
 
-	-- trick when far enough from the last one, with a straight, clear run for the wheelie + flight
+	-- a trick whenever the ride is on the ground and the route ahead is not a sharp corner
 	local airtime = 2 * cfg.JumpVy / workspace.Gravity
 	local run = cfg.CruiseSpeed * airtime
 	if cfg.Wheelie then run += cfg.CruiseSpeed * (0.4 + cfg.WheelieTime) end
 	local gate
 	if distSince < cfg.FlipSpacing then gate = ("riding %d/%d studs"):format(distSince, cfg.FlipSpacing)
-	elseif math.abs(ang) >= 0.3 then gate = "turning"
+	elseif math.abs(ang) >= 0.6 then gate = "turning"
 	elseif os.clock() - lastEnd < cfg.Cooldown then gate = "cooldown"
 	elseif not grounded(s) then gate = "not grounded"
-	end
-	if not gate then
-		if roadMode and roadCache then
-			-- every point of the straight run (and the landing) must be on the road, else wait for a better spot
-			local d = 8
-			while d <= run + 10 do
-				if not onRoad(roadCache, pos + nf * d, cfg.RoadHalfWidth) then gate = "off-road ahead, waiting"; break end
-				d += 8
-			end
-		else
-			local pt, walked, atEnd = lookahead(pos, run + 12)
-			if atEnd and walked < run + 12 then gate = "end of route too close"
-			elseif flat(pt - pos).Magnitude < walked * 0.9 then gate = "curve ahead" end
-		end
+	else
+		local bend, ended, walked = bendAhead(pos, run + 10)
+		if ended and walked < run + 10 then gate = "end of route too close"
+		elseif bend > math.rad(cfg.MaxBend) then gate = "corner ahead, waiting" end
 	end
 	if Farm.Stats.gate ~= (gate or "go") then Farm.Stats.gate = gate or "go"; changed() end
 	if not gate then startTrick(s, nf) end

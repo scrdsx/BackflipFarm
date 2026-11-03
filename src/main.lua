@@ -52,7 +52,7 @@ tRoute:Slider({ Name = "Shuttle length", Min = 60, Max = 400, Step = 10, Default
 tRoute:Slider({ Name = "Turn rate", Min = 1, Max = 6, Step = 0.5, Default = cfg.TurnRate, Callback = function(v) cfg.TurnRate = v end })
 tRoute:Toggle({ Name = "Loop when route ends meet", Default = cfg.LoopRoute, Callback = function(v) cfg.LoopRoute = v end })
 tRoute:Slider({ Name = "Max distance from route", Min = 50, Max = 800, Step = 10, Default = cfg.MaxRouteDist, Suffix = " st", Callback = function(v) cfg.MaxRouteDist = v end })
-tRoute:Slider({ Name = "Road width allowed", Min = 6, Max = 30, Step = 1, Default = cfg.RoadHalfWidth, Suffix = " st", Callback = function(v) cfg.RoadHalfWidth = v end })
+tRoute:Slider({ Name = "Max corner for a trick", Min = 20, Max = 150, Step = 5, Default = cfg.MaxBend, Suffix = " deg", Callback = function(v) cfg.MaxBend = v end })
 tRoute:Toggle({ Name = "Stop for obstacles", Default = cfg.AvoidObstacles, Callback = function(v) cfg.AvoidObstacles = v end })
 tRoute:Button({ Name = "Swap ride forward/back", Callback = function()
 	Farm:FlipForward()
