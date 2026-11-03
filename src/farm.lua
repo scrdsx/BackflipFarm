@@ -5,6 +5,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local RS = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
+local STEP = RunService.PreSimulation or RunService.Heartbeat
 
 local lp = Players.LocalPlayer
 local env = getgenv and getgenv() or _G
@@ -12,18 +13,18 @@ local ROUTE_FILE = "ScrdsxBackflipRoute.json"
 
 local Farm = {
 	Config = {
-		CruiseSpeed = 40,    -- studs/s while riding the route
+		CruiseSpeed = 70,    -- studs/s while riding the route
 		JumpVy = 90,         -- launch speed; airtime = 2*vy/g
 		MaxVy = 120,         -- auto-raise ceiling (higher = harder landing, may trigger the game's fall bail)
-		FlipSpacing = 40,    -- studs ridden between tricks
-		Cooldown = 0.4,      -- minimum seconds between tricks
+		FlipSpacing = 0,     -- studs ridden between tricks
+		Cooldown = 0.15,      -- minimum seconds between tricks
 		ShuttleLength = 160, -- studs, used when no route is saved
-		TurnRate = 3,        -- rad/s steering at corners and ends
+		TurnRate = 5,        -- rad/s steering at corners and ends
 		LandGap = 10,        -- ray length counted as grounded (the seat sits well above the road)
 		AutoRaise = true,    -- raise JumpVy when a flip fails to register
 		AvoidObstacles = true,
 		Wheelie = true,      -- hold a wheelie, then backflip out of it
-		WheelieTime = 0.25,  -- seconds the wheelie is held before the flip
+		WheelieTime = 0.15,  -- seconds the wheelie is held before the flip
 		WheeliePitch = 40,   -- degrees the nose is held at
 		LoopRoute = true,    -- loop when the route's ends meet, otherwise ride it back and forth
 		MaxRouteDist = 250,  -- refuse to drive if the route is farther than this from you
@@ -41,6 +42,7 @@ local flipping, lastEnd, dir, attempt, pending = false, 0, 1, 0, false
 local pts, idx, step, fwd, loop = {}, 1, 1, 1, false
 local distSince, lastPos, blockedSince, lastRec, pathRetry = 0, nil, nil, nil, 0
 local flipConn
+local searching = false
 
 local function changed() if Farm.Changed then Farm.Changed() end end
 local function status(s) if Farm.Stats.status ~= s then Farm.Stats.status = s; changed() end end
@@ -204,6 +206,7 @@ local function roadPath(pos)
 	end
 	local best, bestScore
 	for _ = 1, 10 do
+		task.wait() -- spread the search over a few frames
 		local A, B = cands[math.random(#cands)], cands[math.random(#cands)]
 		if (A - B).Magnitude > 250 then
 			local l1, l2, l3 = leg(pos, v3(A)), leg(v3(A), v3(B)), leg(v3(B), pos)
@@ -326,7 +329,7 @@ local function backflip(s, ahead, restoreIn)
 
 	local turned, t, landUntil = 0, 0, nil
 	local prevUp = s.CFrame.UpVector
-	flipConn = RunService.Heartbeat:Connect(function(dt)
+	flipConn = STEP:Connect(function(dt)
 		dt = math.min(dt, 0.05)
 		if not Farm.Enabled or not s.Parent or seat() ~= s then
 			flipConn:Disconnect()
@@ -366,7 +369,7 @@ local function backflip(s, ahead, restoreIn)
 		local deficit = math.min(math.abs(w) * t, 2 * math.pi) - turned
 		if deficit > 0.04 then s.CFrame = s.CFrame * CFrame.Angles(math.sign(w) * deficit * 0.6, 0, 0) end
 		if turned >= 2 * math.pi or t > airtime + 0.6 then
-			landUntil = os.clock() + math.max(0.2, airtime - t) + 0.25
+			landUntil = os.clock() + math.max(0.2, airtime - t) + 0.12
 		end
 	end)
 end
@@ -380,7 +383,7 @@ local function wheelieThenFlip(s, ahead)
 	local hv = ahead * cfg.CruiseSpeed
 	local target = math.rad(cfg.WheeliePitch)
 	local t, held = 0, nil
-	flipConn = RunService.Heartbeat:Connect(function(dt)
+	flipConn = STEP:Connect(function(dt)
 		dt = math.min(dt, 0.05)
 		if not Farm.Enabled or not s.Parent or seat() ~= s then
 			flipConn:Disconnect()
@@ -448,7 +451,7 @@ end
 local function drive(s, dt)
 	local cfg = Farm.Config
 	local pos = s.Position
-	local target, along = pursuit(pos, math.clamp(cfg.CruiseSpeed * 0.6, 12, 40))
+	local target, along = pursuit(pos, math.clamp(cfg.CruiseSpeed * 0.8, 15, 60))
 	if along >= 0.999 or flat(pts[idx] - pos).Magnitude < 6 then advance() end
 	local to = flat(target - pos)
 	if to.Magnitude < 1 then return end
@@ -458,7 +461,7 @@ local function drive(s, dt)
 	if f.Magnitude < 0.05 then return end
 	f = f.Unit
 	local ang = math.atan2(f:Cross(want).Y, f:Dot(want))
-	local rot = math.clamp(ang, -cfg.TurnRate * dt, cfg.TurnRate * dt)
+	local rot = math.clamp(ang * math.min(1, dt * 8), -cfg.TurnRate * dt, cfg.TurnRate * dt)
 	local cf = s.CFrame
 	s.CFrame = CFrame.new(cf.Position) * CFrame.Angles(0, rot, 0) * cf.Rotation
 	local nf = flat(s.CFrame.LookVector) * fwd
@@ -513,7 +516,7 @@ local function drive(s, dt)
 	if not gate then startTrick(s, nf) end
 end
 
-table.insert(conns, RunService.Heartbeat:Connect(function(dt)
+table.insert(conns, STEP:Connect(function(dt)
 	-- route recording works with the farm off: just ride the path you want
 	if Farm.Recording then
 		local s = seat()
@@ -528,9 +531,15 @@ table.insert(conns, RunService.Heartbeat:Connect(function(dt)
 	local s = seat()
 	if not s then reseat(); return end
 	if #pts == 0 then
-		if os.clock() - pathRetry < 1 then return end
-		pathRetry = os.clock()
-		if not buildPath(s) then pathRetry = os.clock() + 2; return end
+		if searching or os.clock() < pathRetry then return end
+		searching = true
+		status("Finding route...")
+		task.spawn(function()
+			local ok = buildPath(s)
+			searching = false
+			if not ok then pathRetry = os.clock() + 2 end
+		end)
+		return
 	end
 	drive(s, math.min(dt, 0.05))
 end))
