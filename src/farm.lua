@@ -15,7 +15,7 @@ local Farm = {
 		CruiseSpeed = 40,    -- studs/s while riding the route
 		JumpVy = 90,         -- launch speed; airtime = 2*vy/g
 		MaxVy = 120,         -- auto-raise ceiling (higher = harder landing, may trigger the game's fall bail)
-		FlipSpacing = 60,    -- studs ridden between tricks
+		FlipSpacing = 40,    -- studs ridden between tricks
 		Cooldown = 0.4,      -- minimum seconds between tricks
 		ShuttleLength = 160, -- studs, used when no route is saved
 		TurnRate = 3,        -- rad/s steering at corners and ends
@@ -23,13 +23,13 @@ local Farm = {
 		AutoRaise = true,    -- raise JumpVy when a flip fails to register
 		AvoidObstacles = true,
 		Wheelie = true,      -- hold a wheelie, then backflip out of it
-		WheelieTime = 1.0,   -- seconds held before the flip
+		WheelieTime = 0.6,   -- seconds held before the flip
 		WheeliePitch = 40,   -- degrees the nose is held at
 		LoopRoute = true,    -- loop when the route's ends meet, otherwise ride it back and forth
 		MaxRouteDist = 250,  -- refuse to drive if the route is farther than this from you
 		UseRoads = true,     -- build the route from the game's road network (no recording needed)
 	},
-	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle", gate = "-" },
+	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle", gate = "-", road = "-" },
 	Enabled = false,
 	Recording = false,
 	Route = {},
@@ -149,13 +149,15 @@ end
 local roadCache
 local function getRoads()
 	if roadCache then return roadCache end
-	if not workspace:FindFirstChild("BezierRoads") then return nil end
+	if not workspace:FindFirstChild("BezierRoads") then return nil, "no Workspace.BezierRoads" end
 	local ok, res = pcall(function()
 		local RG = require(RS.Modules.Reusables.RoadGraph)
-		return RG.new(RG.sample())
+		local data = RG.sample()
+		if #data.roads == 0 then error("BezierRoads has no roads") end
+		return RG.new(data)
 	end)
-	if ok then roadCache = res end
-	return roadCache
+	if ok then roadCache = res; return res end
+	return nil, "load failed: " .. tostring(res)
 end
 
 -- longest stretch of a path that stays within ~14 degrees of its heading (long straights suit the trick run)
@@ -181,10 +183,13 @@ end
 
 -- try a handful of far-away road points and keep the route with the longest straight stretch
 local function roadPath(pos)
-	local g = getRoads()
-	if not g then return nil end
+	local g, why = getRoads()
+	if not g then return nil, why end
 	local near = g:closest(pos)
-	if not near or near.distance > Farm.Config.MaxRouteDist then return nil end
+	if not near then return nil, "no road found" end
+	if near.distance > Farm.Config.MaxRouteDist then
+		return nil, ("nearest road is %d studs away"):format(near.distance)
+	end
 	local here = Vector2.new(pos.X, pos.Z)
 	local cands = {}
 	for _, p in ipairs(g.points) do
@@ -205,21 +210,28 @@ local function roadPath(pos)
 			if not bestScore or score > bestScore then best, bestScore = path, score end
 		end
 	end
+	if not best then return nil, "no road route found" end
 	return best
 end
 
 local function buildPath(s)
 	local cfg = Farm.Config
 	if cfg.UseRoads then
-		local path = roadPath(s.Position)
+		local path, why = roadPath(s.Position)
 		if path then
 			pts = path
 			loop, idx, step = false, 2, 1 -- ride along the road, then back
 			Farm.Stats.mode = "Road (" .. #pts .. " pts)"
 			Farm.Stats.points = #pts
+			Farm.Stats.road = "ok"
 			changed()
 			return true
 		end
+		-- no silent fallback: riding some other route unseen is what we are avoiding
+		Farm.Stats.road = why or "failed"
+		status("Road route failed (see Route tab)")
+		warn("[Scrdsx] road route failed: " .. tostring(why))
+		return false
 	end
 	local n = #Farm.Route
 	if n >= 2 then
@@ -321,7 +333,7 @@ local function backflip(s, ahead, restoreIn)
 				flipConn:Disconnect()
 				endTrick(restore)
 				status("Landing")
-				task.delay(4, function()
+				task.delay(6, function()
 					if pending and attempt == myAttempt then
 						pending = false
 						Farm.Stats.fails += 1
@@ -473,7 +485,7 @@ table.insert(conns, RunService.Heartbeat:Connect(function(dt)
 	if #pts == 0 then
 		if os.clock() - pathRetry < 1 then return end
 		pathRetry = os.clock()
-		if not buildPath(s) then return end
+		if not buildPath(s) then pathRetry = os.clock() + 2; return end
 	end
 	drive(s, math.min(dt, 0.05))
 end))
