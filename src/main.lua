@@ -34,6 +34,11 @@ tFarm:Toggle({ Name = "Auto-raise jump on miss", Default = cfg.AutoRaise, Callba
 local tRoute = win:Tab("Route")
 local lMode = tRoute:Label({ Name = "Route mode" })
 local lPts = tRoute:Label({ Name = "Route points" })
+tRoute:Toggle({ Name = "Auto road route (no recording)", Default = cfg.UseRoads, Callback = function(v)
+	cfg.UseRoads = v
+	Farm:RebuildPath()
+end })
+tRoute:Button({ Name = "Pick a new road route", Callback = function() Farm:RebuildPath() end })
 tRoute:Toggle({ Name = "Record route (ride it yourself)", Default = false, Callback = function(v)
 	Farm:SetRecording(v)
 	win:Notify(v and "Recording: ride your safe path" or ("Route saved: " .. #Farm.Route .. " points"))

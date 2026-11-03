@@ -27,6 +27,7 @@ local Farm = {
 		WheeliePitch = 40,   -- degrees the nose is held at
 		LoopRoute = true,    -- loop when the route's ends meet, otherwise ride it back and forth
 		MaxRouteDist = 250,  -- refuse to drive if the route is farther than this from you
+		UseRoads = true,     -- build the route from the game's road network (no recording needed)
 	},
 	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle", gate = "-" },
 	Enabled = false,
@@ -144,8 +145,82 @@ local function lookahead(pos, dist)
 	return cur, walked, false
 end
 
+-- road network: the game's own RoadGraph module (Workspace.BezierRoads) can path between any two points
+local roadCache
+local function getRoads()
+	if roadCache then return roadCache end
+	if not workspace:FindFirstChild("BezierRoads") then return nil end
+	local ok, res = pcall(function()
+		local RG = require(RS.Modules.Reusables.RoadGraph)
+		return RG.new(RG.sample())
+	end)
+	if ok then roadCache = res end
+	return roadCache
+end
+
+-- longest stretch of a path that stays within ~14 degrees of its heading (long straights suit the trick run)
+local function straightness(path)
+	local best, run, startDir = 0, 0, nil
+	for i = 2, #path do
+		local d = flat(path[i] - path[i - 1])
+		local len = d.Magnitude
+		if len > 0.5 then
+			d = d.Unit
+			if not startDir then
+				startDir, run = d, len
+			elseif startDir:Dot(d) > 0.97 then
+				run += len
+			else
+				best = math.max(best, run)
+				startDir, run = d, len
+			end
+		end
+	end
+	return math.max(best, run)
+end
+
+-- try a handful of far-away road points and keep the route with the longest straight stretch
+local function roadPath(pos)
+	local g = getRoads()
+	if not g then return nil end
+	local near = g:closest(pos)
+	if not near or near.distance > Farm.Config.MaxRouteDist then return nil end
+	local here = Vector2.new(pos.X, pos.Z)
+	local cands = {}
+	for _, p in ipairs(g.points) do
+		local d = (p - here).Magnitude
+		if d > 300 and d < 1200 then cands[#cands + 1] = p end
+	end
+	if #cands == 0 then
+		for _, p in ipairs(g.points) do
+			if (p - here).Magnitude > 100 then cands[#cands + 1] = p end
+		end
+	end
+	local best, bestScore
+	for _ = 1, math.min(14, #cands) do
+		local p = cands[math.random(#cands)]
+		local ok, path = pcall(function() return g:route(pos, Vector3.new(p.X, 0, p.Y)) end)
+		if ok and path and #path >= 3 then
+			local score = straightness(path)
+			if not bestScore or score > bestScore then best, bestScore = path, score end
+		end
+	end
+	return best
+end
+
 local function buildPath(s)
 	local cfg = Farm.Config
+	if cfg.UseRoads then
+		local path = roadPath(s.Position)
+		if path then
+			pts = path
+			loop, idx, step = false, 2, 1 -- ride along the road, then back
+			Farm.Stats.mode = "Road (" .. #pts .. " pts)"
+			Farm.Stats.points = #pts
+			changed()
+			return true
+		end
+	end
 	local n = #Farm.Route
 	if n >= 2 then
 		local best, bd = 1, math.huge
@@ -476,6 +551,8 @@ function Farm:TestFlip()
 	self.Enabled = true
 	startTrick(s, nf)
 end
+
+function Farm:RebuildPath() pts = {} end
 
 function Farm:FlipDirection() dir = -dir; self.Stats.direction = dir == 1 and "Back" or "Front"; changed() end
 function Farm:FlipForward() fwd = -fwd; pts = {} end
