@@ -8,6 +8,21 @@ local MODULES = { "ui", "farm", "loading", "main" } -- main last
 
 local sources, cache = {}, {}
 
+-- version check support: main.lua polls this to notice a new release
+local function fetchVersion()
+	local v
+	if LOCAL then v = readfile(LOCAL .. "version.txt")
+	else v = game:HttpGet(BASE .. "version.txt?t=" .. os.time()) end
+	return (v:gsub("%s+", ""))
+end
+env.ScrdsxFetchVersion = fetchVersion
+local okv, ver = pcall(fetchVersion)
+env.ScrdsxVersion = okv and ver or "unknown"
+env.ScrdsxReload = function() -- re-run this loader (used by "Update now")
+	if LOCAL then return loadstring(readfile(LOCAL .. "loader.lua"))() end
+	return loadstring(game:HttpGet(BASE .. "loader.lua?t=" .. os.time()))()
+end
+
 local function fetch(name)
 	local path = "src/" .. name .. ".lua"
 	if LOCAL then return readfile(LOCAL .. path) end

@@ -3,6 +3,7 @@
 Black-themed UI + backflip autofarm for game 122840796290491 (own game).
 
 ```
+version.txt       current version; bump it on every release (clients notify when it changes)
 loader.lua        the loadstring target; fetches every file in src/ and runs them
 src/ui.lua        UI library (sidebar tabs, animated search, toggle/slider/button/label, toasts)
 src/farm.lua      farm logic (launch + spin, TrickState feedback, auto-raise jump power)
