@@ -16,11 +16,11 @@ local Farm = {
 		Cooldown = 0.4,      -- minimum seconds between flips
 		ShuttleLength = 140, -- studs, used when no route is recorded
 		TurnRate = 3,        -- rad/s steering at corners and ends
-		LandGap = 3.5,       -- ray length counted as grounded
+		LandGap = 10,        -- ray length counted as grounded (the seat sits well above the road)
 		AutoRaise = true,    -- raise JumpVy when a flip fails to register
 		AvoidObstacles = true,
 	},
-	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle" },
+	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle", gate = "-" },
 	Enabled = false,
 	Recording = false,
 	Route = env.__ScrdsxRoute or {},
@@ -52,6 +52,7 @@ local function rayParams(s)
 end
 
 local function grounded(s)
+	if math.abs(s.AssemblyLinearVelocity.Y) > 6 then return false end -- already in the air
 	return workspace:Raycast(s.Position, Vector3.new(0, -Farm.Config.LandGap, 0), rayParams(s)) ~= nil
 end
 
@@ -212,11 +213,16 @@ local function drive(s, dt)
 	-- flip when far enough from the last one, with room to land before the next turn
 	local airtime = 2 * cfg.JumpVy / workspace.Gravity
 	local flight = cfg.CruiseSpeed * 0.7 * airtime
-	if distSince >= cfg.FlipSpacing and math.abs(ang) < 0.3 and to.Magnitude > flight + 12
-		and os.clock() - lastEnd >= cfg.Cooldown and grounded(s)
-		and not (cfg.AvoidObstacles and blocked(s, nf, flight + 10)) then
-		backflip(s, nf)
+	local gate
+	if distSince < cfg.FlipSpacing then gate = ("riding %d/%d studs"):format(distSince, cfg.FlipSpacing)
+	elseif math.abs(ang) >= 0.3 then gate = "turning"
+	elseif to.Magnitude <= flight + 12 then gate = "end of route too close"
+	elseif os.clock() - lastEnd < cfg.Cooldown then gate = "cooldown"
+	elseif not grounded(s) then gate = "not grounded"
+	elseif cfg.AvoidObstacles and blocked(s, nf, flight + 10) then gate = "obstacle ahead"
 	end
+	if Farm.Stats.gate ~= (gate or "flipping") then Farm.Stats.gate = gate or "flipping"; changed() end
+	if not gate then backflip(s, nf) end
 end
 
 table.insert(conns, RunService.Heartbeat:Connect(function(dt)
@@ -292,6 +298,16 @@ function Farm:ClearRoute()
 	env.__ScrdsxRoute = self.Route
 	self.Stats.points, self.Stats.mode = 0, "Shuttle"
 	changed()
+end
+
+-- fire one flip right now (for testing the spin without waiting for the route)
+function Farm:TestFlip()
+	local s = seat()
+	if not s or flipping then return end
+	local nf = flat(s.CFrame.LookVector) * fwd
+	nf = nf.Magnitude > 0.05 and nf.Unit or Vector3.new(0, 0, -1)
+	self.Enabled = true
+	backflip(s, nf)
 end
 
 function Farm:FlipDirection() dir = -dir; self.Stats.direction = dir == 1 and "Back" or "Front"; changed() end
