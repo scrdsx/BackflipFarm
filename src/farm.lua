@@ -101,7 +101,7 @@ end
 -- anything solid within `dist` studs ahead (chest height)?
 local function blocked(s, forward, dist)
 	local hit = workspace:Raycast(s.Position + Vector3.new(0, 1.8, 0), forward * dist, rayParams(s))
-	return hit ~= nil and hit.Instance.CanCollide
+	return hit ~= nil and hit.Instance.CanCollide and hit.Normal.Y < 0.6 -- slopes and the ground are not obstacles
 end
 
 -- the ride's stabilizers fight our spin: release them for the trick, restore afterwards
@@ -152,18 +152,30 @@ local function lookahead(pos, dist)
 end
 
 -- road network: the game's own RoadGraph module (Workspace.BezierRoads) can path between any two points
-local roadCache
+local roadCache, roadK = nil, 0
 local function getRoads()
 	if roadCache then return roadCache end
 	if not workspace:FindFirstChild("BezierRoads") then return nil, "no Workspace.BezierRoads" end
-	local ok, res = pcall(function()
+	local ok, res, k = pcall(function()
 		local RG = require(RS.Modules.Reusables.RoadGraph)
 		local data = RG.sample()
 		if #data.roads == 0 then error("BezierRoads has no roads") end
-		return RG.new(data)
+		local n = 0
+		for _ in pairs(data.intersections) do n += 1 end
+		return RG.new(data), n
 	end)
-	if ok then roadCache = res; return res end
+	if ok then roadCache, roadK = res, k or 0; return res end
 	return nil, "load failed: " .. tostring(res)
+end
+
+-- is `p` on the road? Road segments stop short of intersections, so anything near an intersection centre counts too
+local function onRoad(g, p, halfWidth)
+	if g:nearest(p, halfWidth) then return true end
+	local here = Vector2.new(p.X, p.Z)
+	for i = 1, roadK do
+		if (g.points[i] - here).Magnitude < 55 then return true end
+	end
+	return false
 end
 
 -- longest stretch of a path that stays within ~14 degrees of its heading (long straights suit the trick run)
@@ -552,14 +564,13 @@ local function drive(s, dt)
 	elseif math.abs(ang) >= 0.3 then gate = "turning"
 	elseif os.clock() - lastEnd < cfg.Cooldown then gate = "cooldown"
 	elseif not grounded(s) then gate = "not grounded"
-	elseif cfg.AvoidObstacles and blocked(s, nf, run + 10) then gate = "obstacle ahead"
 	end
 	if not gate then
 		if roadMode and roadCache then
 			-- every point of the straight run (and the landing) must be on the road, else wait for a better spot
 			local d = 8
 			while d <= run + 10 do
-				if not roadCache:nearest(pos + nf * d, cfg.RoadHalfWidth) then gate = "off-road ahead, waiting"; break end
+				if not onRoad(roadCache, pos + nf * d, cfg.RoadHalfWidth) then gate = "off-road ahead, waiting"; break end
 				d += 8
 			end
 		else
