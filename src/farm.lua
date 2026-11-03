@@ -10,8 +10,8 @@ local env = getgenv and getgenv() or _G
 local Farm = {
 	Config = {
 		CruiseSpeed = 40,    -- studs/s while riding the route
-		JumpVy = 80,         -- launch speed; airtime = 2*vy/g
-		MaxVy = 110,         -- auto-raise ceiling (higher = harder landing, may trigger the game's fall bail)
+		JumpVy = 90,         -- launch speed; airtime = 2*vy/g
+		MaxVy = 120,         -- auto-raise ceiling (higher = harder landing, may trigger the game's fall bail)
 		FlipSpacing = 45,    -- studs ridden between flips
 		Cooldown = 0.4,      -- minimum seconds between flips
 		ShuttleLength = 140, -- studs, used when no route is recorded
@@ -110,13 +110,57 @@ local function advance()
 	idx = math.clamp(nxt, 1, #pts)
 end
 
+-- walk the route ahead of `pos` for `dist` studs: returns the point reached, distance walked, and whether the route ended first
+local function lookahead(pos, dist)
+	local cur, walked, i = pos, 0, idx
+	while true do
+		local p = pts[i]
+		walked += flat(p - cur).Magnitude
+		cur = p
+		if walked >= dist then return cur, walked, false end
+		local nxt = i + step
+		if nxt < 1 or nxt > #pts then return cur, walked, true end
+		i = nxt
+	end
+end
+
+local lastSeatTry = 0
+-- after a bail or dismount: find our ride, move next to it and sit / press its prompt
+local function reseat()
+	if os.clock() - lastSeatTry < 2 then return end
+	lastSeatTry = os.clock()
+	local c = lp.Character
+	local hrp = c and c:FindFirstChild("HumanoidRootPart")
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	if not (hrp and h) or h.Health <= 0 then status("Waiting to respawn"); return end
+	if c:GetAttribute("Ragdolled") then status("Recovering from bail"); return end
+	local ride
+	local rides = workspace:FindFirstChild("Rides")
+	if rides then
+		for _, m in ipairs(rides:GetChildren()) do
+			if m:GetAttribute("OwnerUserId") == lp.UserId or m.Name == "Ride_" .. lp.Name then ride = m break end
+		end
+	end
+	local ds = ride and ride:FindFirstChild("DriveSeat")
+	if not ds then status("No ride found: spawn it"); return end
+	status("Getting back on")
+	hrp.CFrame = ds.CFrame * CFrame.new(0, 3, 0)
+	pcall(function() ds:Sit(h) end)
+	if fireproximityprompt then
+		for _, d in ipairs(ride:GetDescendants()) do
+			if d:IsA("ProximityPrompt") then pcall(fireproximityprompt, d) end
+		end
+	end
+	distSince, lastPos, blockedSince = 0, nil, nil
+end
+
 local function backflip(s, ahead)
 	local cfg = Farm.Config
 	flipping, pending = true, true
 	attempt += 1
 	local myAttempt = attempt
 	local airtime = 2 * cfg.JumpVy / workspace.Gravity
-	local w = 2 * math.pi / (airtime * 0.85) * dir -- finish the turn before landing
+	local w = 2 * math.pi / (airtime * 0.6) * dir -- finish the turn well before landing
 	local restore = releaseStabilizers(s.Parent)
 	local hv = ahead * cfg.CruiseSpeed * 0.7 -- slower over the jump = shorter flight
 	s.AssemblyLinearVelocity = Vector3.new(hv.X, cfg.JumpVy, hv.Z)
@@ -216,10 +260,15 @@ local function drive(s, dt)
 	local gate
 	if distSince < cfg.FlipSpacing then gate = ("riding %d/%d studs"):format(distSince, cfg.FlipSpacing)
 	elseif math.abs(ang) >= 0.3 then gate = "turning"
-	elseif to.Magnitude <= flight + 12 then gate = "end of route too close"
 	elseif os.clock() - lastEnd < cfg.Cooldown then gate = "cooldown"
 	elseif not grounded(s) then gate = "not grounded"
 	elseif cfg.AvoidObstacles and blocked(s, nf, flight + 10) then gate = "obstacle ahead"
+	end
+	if not gate then
+		-- room to land: the route ahead must be long enough and roughly straight (the flight is a straight line)
+		local pt, walked, atEnd = lookahead(pos, flight + 12)
+		if atEnd and walked < flight + 12 then gate = "end of route too close"
+		elseif flat(pt - pos).Magnitude < walked * 0.9 then gate = "curve ahead" end
 	end
 	if Farm.Stats.gate ~= (gate or "flipping") then Farm.Stats.gate = gate or "flipping"; changed() end
 	if not gate then backflip(s, nf) end
@@ -239,7 +288,7 @@ table.insert(conns, RunService.Heartbeat:Connect(function(dt)
 	end
 	if not Farm.Enabled or flipping then return end
 	local s = seat()
-	if not s then status("Get on your ride"); return end
+	if not s then reseat(); return end
 	if #pts == 0 then buildPath(s) end
 	drive(s, math.min(dt, 0.05))
 end))
