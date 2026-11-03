@@ -45,6 +45,7 @@ local distSince, lastPos, blockedSince, lastRec, pathRetry = 0, nil, nil, nil, 0
 local flipConn
 local searching = false
 local roadMode, lastIdxChange = false, 0
+local vdir -- our own travel direction (flat unit vector); the ride is turned to face it
 
 local function changed() if Farm.Changed then Farm.Changed() end end
 local function status(s) if Farm.Stats.status ~= s then Farm.Stats.status = s; changed() end end
@@ -266,7 +267,7 @@ local function buildPath(s)
 			Farm.Stats.mode = "Road loop (" .. #pts .. " pts)"
 			Farm.Stats.points = #pts
 			Farm.Stats.road = "ok"
-			roadMode = true
+			roadMode, vdir = true, nil
 			changed()
 			return true
 		end
@@ -276,7 +277,7 @@ local function buildPath(s)
 		status("Road route failed (see Route tab)")
 		return false
 	end
-	roadMode = false
+	roadMode, vdir = false, nil
 	local n = #Farm.Route
 	if n >= 2 then
 		local best, bd = 1, math.huge
@@ -371,8 +372,7 @@ local function backflip(s, ahead, restoreIn)
 		if landUntil then
 			-- landing assist: keep the ride level until it touches down
 			s.AssemblyAngularVelocity = Vector3.zero
-			local fl = flat(s.CFrame.LookVector)
-			if fl.Magnitude > 0.05 then s.CFrame = CFrame.lookAt(s.Position, s.Position + fl.Unit) end
+			s.CFrame = CFrame.lookAt(s.Position, s.Position + ahead * fwd)
 			if os.clock() > landUntil then
 				flipConn:Disconnect()
 				endTrick(restore)
@@ -431,8 +431,7 @@ local function wheelieThenFlip(s, ahead)
 		if pitch > math.rad(80) then -- going over: abort, level out
 			flipConn:Disconnect()
 			s.AssemblyAngularVelocity = Vector3.zero
-			local fl = flat(s.CFrame.LookVector)
-			if fl.Magnitude > 0.05 then s.CFrame = CFrame.lookAt(s.Position, s.Position + fl.Unit) end
+			s.CFrame = CFrame.lookAt(s.Position, s.Position + ahead * fwd)
 			endTrick(restore)
 			status("Wheelie too steep, aborted")
 			return
@@ -486,22 +485,35 @@ local function drive(s, dt)
 		status("Stuck, picking a new route")
 		return
 	end
+	for _ = 1, 80 do
+		local a, b = flat(pts[prevIdx()]), flat(pts[idx])
+		local ab = b - a
+		local len2 = ab:Dot(ab)
+		if (len2 > 0.01 and flat(pos - a):Dot(ab) / len2 or 1) >= 1 then advance() else break end
+	end
 	local target, along = pursuit(pos, math.clamp(cfg.CruiseSpeed * 0.8, 15, 60))
 	if along >= 0.999 or flat(pts[idx] - pos).Magnitude < 6 then advance() end
 	local to = flat(target - pos)
 	if to.Magnitude < 1 then return end
 	local want = to.Unit
 
-	local f = flat(s.CFrame.LookVector) * fwd
-	if f.Magnitude < 0.05 then return end
-	f = f.Unit
-	local ang = math.atan2(f:Cross(want).Y, f:Dot(want))
+	if not vdir then
+		local f0 = flat(s.CFrame.LookVector) * fwd
+		if f0.Magnitude < 0.05 then return end
+		vdir = f0.Unit
+	end
+	-- turn our travel direction toward the route at a limited rate; the ride then faces it and moves along it,
+	-- so it always heads for the route instead of depending on how the physics happens to rotate it
+	local ang = math.atan2(vdir:Cross(want).Y, vdir:Dot(want))
 	local rot = math.clamp(ang * math.min(1, dt * 8), -cfg.TurnRate * dt, cfg.TurnRate * dt)
+	vdir = (CFrame.Angles(0, rot, 0) * vdir).Unit
 	local cf = s.CFrame
-	s.CFrame = CFrame.new(cf.Position) * CFrame.Angles(0, rot, 0) * cf.Rotation
-	local nf = flat(s.CFrame.LookVector) * fwd
-	if nf.Magnitude < 0.05 then return end
-	nf = nf.Unit
+	local look = flat(cf.LookVector) * fwd
+	if look.Magnitude > 0.05 then
+		local dyaw = math.atan2(look.Unit:Cross(vdir).Y, look.Unit:Dot(vdir))
+		s.CFrame = CFrame.new(cf.Position) * CFrame.Angles(0, dyaw, 0) * cf.Rotation
+	end
+	local nf = vdir
 
 	-- obstacle ahead: stop and wait; a ping-pong route turns back, a loop waits then picks a fresh route
 	if cfg.AvoidObstacles and blocked(s, nf, cfg.CruiseSpeed * 0.6 + 6) then
@@ -607,7 +619,7 @@ end)
 
 -- API ------------------------------------------------------------------------
 function Farm:SetEnabled(v)
-	pts = {}
+	pts, vdir = {}, nil
 	if v then
 		local s = seat()
 		if s then
