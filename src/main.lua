@@ -53,12 +53,26 @@ tRoute:Button({ Name = "Swap flip direction", Callback = function() Farm:FlipDir
 
 -- Manual tab: a backflip whenever you want one, for fun (Autofarm must be off)
 local tManual = win:Tab("Manual")
-local manualKey = tManual:Keybind({ Name = "Backflip key (click, then press a key)", Default = Enum.KeyCode.B })
+tManual:Label({ Name = "Rebind", Value = "click a key box" })
+local manualBinds = {
+	{ kind = "backflip", name = "Backflip", key = Enum.KeyCode.B },
+	{ kind = "frontflip", name = "Front flip", key = Enum.KeyCode.N },
+	{ kind = "spin180", name = "180 spin", key = Enum.KeyCode.M },
+	{ kind = "spin360", name = "360 spin", key = Enum.KeyCode.J },
+	{ kind = "roll", name = "Barrel roll", key = Enum.KeyCode.K },
+	{ kind = "hop", name = "Hop", key = Enum.KeyCode.H },
+}
+for _, b in ipairs(manualBinds) do
+	b.obj = tManual:Keybind({ Name = b.name, Default = b.key })
+end
+local boostKey = tManual:Keybind({ Name = "Boost (hold)", Default = Enum.KeyCode.Z })
+tManual:Slider({ Name = "Trick jump power", Min = 40, Max = 140, Step = 5, Default = cfg.ManualVy, Callback = function(v) cfg.ManualVy = v end })
+tManual:Slider({ Name = "Boost speed", Min = 40, Max = 200, Step = 5, Default = cfg.BoostSpeed, Suffix = " st/s", Callback = function(v) cfg.BoostSpeed = v end })
+tManual:Toggle({ Name = "Spin right (180 / 360)", Default = cfg.SpinRight, Callback = function(v) cfg.SpinRight = v end })
 tManual:Button({ Name = "Backflip now", Callback = function()
-	if not Farm:ManualFlip() then win:Notify(Farm.Enabled and "Turn Autofarm off first" or "Get on your ride first") end
+	if not Farm:ManualTrick("backflip") then win:Notify(Farm.Enabled and "Turn Autofarm off first" or "Get on your ride first") end
 end })
-tManual:Slider({ Name = "Manual jump power", Min = 40, Max = 140, Step = 5, Default = cfg.ManualVy, Callback = function(v) cfg.ManualVy = v end })
-tManual:Label({ Name = "Keeps your speed and direction", Value = "Esc clears the key" })
+tManual:Label({ Name = "Esc clears a key", Value = "Autofarm off" })
 
 -- Stats tab
 local tStats = win:Tab("Stats")
@@ -120,12 +134,35 @@ if getgenv then getgenv().__BackflipFarm = unload end
 table.insert(win.conns, UIS.InputBegan:Connect(function(i, gp)
 	if i.KeyCode == Enum.KeyCode.RightShift then
 		win:Toggle()
-	elseif not gp and not manualKey:IsListening() and manualKey:Get() and i.KeyCode == manualKey:Get() then
-		if not Farm:ManualFlip() then win:Notify(Farm.Enabled and "Turn Autofarm off first" or "Get on your ride first") end
 	elseif not gp and i.KeyCode == Enum.KeyCode.Slash then
 		win.searchBox:CaptureFocus()
 		task.defer(function() win.searchBox.Text = "" end)
 	end
+end))
+
+-- manual trick keys (separate from the UI key handler so a rebind never fires its own action)
+local function anyListening() -- while a key box is waiting for a key, no other bind may fire
+	if boostKey:IsListening() then return true end
+	for _, b in ipairs(manualBinds) do
+		if b.obj:IsListening() then return true end
+	end
+	return false
+end
+table.insert(win.conns, UIS.InputBegan:Connect(function(i, gp)
+	if gp or i.UserInputType ~= Enum.UserInputType.Keyboard or anyListening() then return end
+	if boostKey:Get() == i.KeyCode then Farm:SetBoost(true) return end
+	for _, b in ipairs(manualBinds) do
+		local k = b.obj:Get()
+		if k and k == i.KeyCode then
+			if not Farm:ManualTrick(b.kind) then
+				win:Notify(Farm.Enabled and "Turn Autofarm off first" or "Get on your ride first")
+			end
+			return
+		end
+	end
+end))
+table.insert(win.conns, UIS.InputEnded:Connect(function(i)
+	if boostKey:Get() == i.KeyCode then Farm:SetBoost(false) end
 end))
 
 win:Notify("Scrdsx Solutions loaded  v" .. tostring(env.ScrdsxVersion or "?"))

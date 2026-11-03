@@ -27,7 +27,9 @@ local Farm = {
 		MaxBend = 70,        -- degrees of route turning a trick may cover (the ride follows the route in the air)
 		MaxRouteDist = 250,  -- studs: nearest road must be closer than this
 		Bounce = false,      -- true: ride the straightest road back and forth instead of a circuit
-		ManualVy = 90,       -- jump power for a manual (keybind) backflip
+		ManualVy = 90,       -- jump power for manual (keybind) tricks
+		SpinRight = false,   -- manual 180 / 360 spins turn right instead of left
+		BoostSpeed = 90,     -- speed the hold-to-boost key rides at
 	},
 	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "-", gate = "-", road = "-", startedAt = 0 },
 	Enabled = false,
@@ -43,6 +45,7 @@ local lastEnd, lastIdxChange, blockedSince = 0, 0, nil
 local searching, retryAt, lastWhy = false, 0, nil
 local trick = nil
 local lastSeatTry = 0
+local boosting = false
 local roads -- { g = RoadGraph, k = intersection count, data = raw road data, vecs = road polylines }
 
 local function changed() if Farm.Changed then Farm.Changed() end end
@@ -509,31 +512,45 @@ local function abortTrick()
 end
 
 -- jump + spin: leave the ground at the ride's speed along the route
+-- rotation axis and a reference vector perpendicular to it (used to measure how far the ride has turned)
+local function axisOf(cf, kind)
+	if kind == "yaw" then return Vector3.yAxis, flat(cf.LookVector) end
+	if kind == "roll" then return cf.LookVector, cf.UpVector end
+	return cf.RightVector, cf.UpVector
+end
+
 local function launch(s)
 	local cfg = Farm.Config
 	local T = trick
-	T.phase, T.t, T.turned, T.launched = "spin", 0, 0, true
-	T.prevUp = s.CFrame.UpVector
+	local spec = T.spec -- nil for the farm's own backflip
+	T.phase, T.t, T.turned = "spin", 0, 0
+	T.axis = spec and spec.axis or "pitch"
+	T.total = spec and spec.total or 2 * math.pi
 	T.vy = T.manual and cfg.ManualVy or cfg.JumpVy
 	T.airtime = 2 * T.vy / workspace.Gravity
-	T.w = 2 * math.pi / (T.airtime * 0.6) * dir -- finish the turn well before landing
+	T.w = T.total / (T.airtime * 0.6) * (spec and spec.sign or dir) -- finish the turn well before landing
 	T.launchAt = os.clock()
-	pending, pendingId = true, T.id
-	local hv = T.manual and T.hv or vdir * cfg.CruiseSpeed -- a manual flip keeps your own speed and direction
+	local _, ref = axisOf(s.CFrame, T.axis)
+	T.prevRef = ref.Magnitude > 0.05 and ref.Unit or nil
+	-- only the farm's own flips wait for the server's "landed" report (and count a miss without it)
+	T.launched = not T.manual
+	pending, pendingId = not T.manual, T.id
+	local hv = T.manual and T.hv or vdir * cfg.CruiseSpeed -- a manual trick keeps your own speed and direction
 	s.AssemblyLinearVelocity = Vector3.new(hv.X, T.vy, hv.Z)
 	status("Flipping")
+	if T.total <= 0 then T.phase = "land" end -- a hop: no spin
 end
 
-local function startTrick(s, manual)
+local function startTrick(s, spec)
 	local cfg = Farm.Config
 	attempt += 1
-	if manual then
+	if spec then
 		-- your own backflip: keep the speed and direction you are riding at, jump straight into the spin
 		local hv = flat(s.AssemblyLinearVelocity)
 		local f = flat(s.CFrame.LookVector) * fwd
 		if hv.Magnitude < 3 then hv = f * 0 end
 		vdir = hv.Magnitude > 3 and hv.Unit or (f.Magnitude > 0.05 and f.Unit or Vector3.new(0, 0, -1))
-		trick = { id = attempt, phase = "spin", t = 0, manual = true, hv = hv, restore = releaseStabilizers(s.Parent) }
+		trick = { id = attempt, phase = "spin", t = 0, manual = true, spec = spec, hv = hv, restore = releaseStabilizers(s.Parent) }
 		launch(s)
 		return
 	end
@@ -587,23 +604,32 @@ local function stepTrick(s, dt)
 
 	if T.phase == "spin" then
 		horizontal()
-		local right = s.CFrame.RightVector
-		s.AssemblyAngularVelocity = right * T.w
-		-- measure the real rotation about the right vector
-		local up = s.CFrame.UpVector
-		T.turned += math.abs(math.atan2(T.prevUp:Cross(up):Dot(right), T.prevUp:Dot(up)))
-		T.prevUp = up
-		-- stay on schedule: if physics turns it too slowly, rotate the missing part directly so the flip always completes
-		local deficit = math.min(math.abs(T.w) * T.t, 2 * math.pi) - T.turned
-		if deficit > 0.04 then s.CFrame = s.CFrame * CFrame.Angles(math.sign(T.w) * deficit * 0.6, 0, 0) end
-		if T.turned >= 2 * math.pi or T.t > T.airtime + 0.6 then T.phase = "land" end
+		local cf = s.CFrame
+		local axis, ref = axisOf(cf, T.axis)
+		s.AssemblyAngularVelocity = axis * T.w
+		-- measure the real rotation about the axis
+		if ref.Magnitude > 0.05 then
+			ref = ref.Unit
+			if T.prevRef then T.turned += math.abs(math.atan2(T.prevRef:Cross(ref):Dot(axis), T.prevRef:Dot(ref))) end
+			T.prevRef = ref
+		end
+		-- stay on schedule: if physics turns it too slowly, rotate the missing part directly so the trick always completes
+		local deficit = math.min(math.abs(T.w) * T.t, T.total) - T.turned
+		if deficit > 0.04 then
+			local a = math.sign(T.w) * deficit * 0.6
+			if T.axis == "yaw" then s.CFrame = CFrame.new(cf.Position) * CFrame.Angles(0, a, 0) * cf.Rotation
+			elseif T.axis == "roll" then s.CFrame = cf * CFrame.Angles(0, 0, -a) -- the look vector is -Z
+			else s.CFrame = cf * CFrame.Angles(a, 0, 0) end
+		end
+		if T.turned >= T.total or T.t > T.airtime + 0.6 then T.phase = "land" end
 		return
 	end
 
 	-- landing: hold the ride level, facing along the route, until it touches down
 	horizontal()
 	s.AssemblyAngularVelocity = Vector3.zero
-	s.CFrame = CFrame.lookAt(s.Position, s.Position + d * fwd)
+	local face = (T.spec and T.spec.faceBack) and -d or d -- a 180 lands facing backwards
+	s.CFrame = CFrame.lookAt(s.Position, s.Position + face * fwd)
 	local now = os.clock()
 	if now >= T.launchAt + T.airtime + 0.1 or (now > T.launchAt + 0.5 and grounded(s)) then finishTrick() end
 end
@@ -667,6 +693,17 @@ local function stepRide(s, dt)
 end
 
 table.insert(conns, STEP:Connect(function(dt)
+	if boosting and not Farm.Enabled and not trick then
+		local bs = seat()
+		if bs then
+			local v = bs.AssemblyLinearVelocity
+			local hv = flat(v)
+			local look = flat(bs.CFrame.LookVector) * fwd
+			local d = hv.Magnitude > 3 and hv.Unit or (look.Magnitude > 0.05 and look.Unit or Vector3.zero)
+			local speed = math.max(hv.Magnitude, Farm.Config.BoostSpeed)
+			bs.AssemblyLinearVelocity = Vector3.new(d.X * speed, v.Y, d.Z * speed)
+		end
+	end
 	if not Farm.Enabled and not trick then return end -- a test flip runs with the farm off
 	dt = math.min(dt, 0.05)
 	local s = seat()
@@ -687,6 +724,10 @@ task.spawn(function()
 		pending = false
 		local S, cfg = Farm.Stats, Farm.Config
 		if name == "Front Flip" then dir = -dir; S.direction = dir == 1 and "Back" or "Front" end -- spun the wrong way
+		if type(cash) == "number" and name ~= "Backflip" and name ~= "Front Flip" then
+			S.earned += cash -- manual tricks (180, 360, ...) pay too
+			S.last = ("%s +$%s"):format(tostring(name), tostring(cash))
+		end
 		if name == "Backflip" or name == "Front Flip" then
 			S.earned += cash or 0
 			S.flips += 1
@@ -728,13 +769,29 @@ function Farm:TestFlip()
 	startTrick(s)
 end
 
--- a backflip on demand while you ride (the farm must be off, it would fight you for control)
-function Farm:ManualFlip()
+-- manual tricks on demand while you ride (the farm must be off, it would fight you for control)
+local TAU = 2 * math.pi
+local MANUAL = {
+	backflip = function() return { axis = "pitch", total = TAU, sign = dir } end,
+	frontflip = function() return { axis = "pitch", total = TAU, sign = -dir } end,
+	spin180 = function() return { axis = "yaw", total = math.pi, sign = Farm.Config.SpinRight and -1 or 1, faceBack = true } end,
+	spin360 = function() return { axis = "yaw", total = TAU, sign = Farm.Config.SpinRight and -1 or 1 } end,
+	roll = function() return { axis = "roll", total = TAU, sign = 1 } end,
+	hop = function() return { axis = "pitch", total = 0, sign = 1 } end,
+}
+
+function Farm:ManualTrick(kind)
 	local s = seat()
-	if not s or trick or self.Enabled then return false end
-	startTrick(s, true)
+	local make = MANUAL[kind]
+	if not s or not make or trick or self.Enabled then return false end
+	startTrick(s, make())
 	return true
 end
+
+function Farm:ManualFlip() return self:ManualTrick("backflip") end
+
+-- hold-to-boost: ride faster along your current direction while the key is held (farm off)
+function Farm:SetBoost(v) boosting = v end
 
 function Farm:FlipDirection() dir = -dir; self.Stats.direction = dir == 1 and "Back" or "Front"; changed() end
 function Farm:FlipForward() fwd = -fwd; vdir = nil end

@@ -36,6 +36,7 @@ local function label(text, size, color, font, align)
 	return new("TextLabel", {
 		BackgroundTransparency = 1, Text = text, TextSize = size or 13, TextColor3 = color or T.text,
 		Font = font or T.font, TextXAlignment = align or Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd, -- long names get "..." instead of running over their neighbours
 	})
 end
 
@@ -386,9 +387,9 @@ end
 -- click, then press a key to bind it (Escape clears). Callback(key) gets an Enum.KeyCode or nil.
 function M:Keybind(o)
 	local f = row(self, o.Name, 40)
-	local n = label(o.Name, 13, T.text); n.Position = UDim2.fromOffset(14, 0); n.Size = UDim2.new(1, -130, 1, 0); n.Parent = f
+	local n = label(o.Name, 13, T.text); n.Position = UDim2.fromOffset(14, 0); n.Size = UDim2.new(1, -150, 1, 0); n.Parent = f
 	local btn = new("TextButton", {
-		AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, -10, .5, 0), Size = UDim2.fromOffset(104, 26),
+		AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, -10, .5, 0), Size = UDim2.fromOffset(120, 26),
 		BackgroundColor3 = T.hover, BorderSizePixel = 0, AutoButtonColor = false, Text = "", Parent = f,
 	}, { corner(6), stroke(T.stroke) })
 	local txt = label("", 12, T.text, T.bold, Enum.TextXAlignment.Center); txt.Size = UDim2.fromScale(1, 1); txt.Parent = btn
@@ -399,7 +400,8 @@ function M:Keybind(o)
 		tween(txt, .15, { TextColor3 = listening and T.accent or T.text })
 	end
 	function obj:Get() return key end
-	function obj:IsListening() return listening end
+	-- still "listening" for a moment after a bind, so the key you just chose does not also fire its action
+	function obj:IsListening() return listening or os.clock() - (obj.boundAt or 0) < 0.25 end
 	function obj:Set(k) key = k; show() end
 	btn.MouseButton1Click:Connect(function()
 		if listening then return end
@@ -409,7 +411,8 @@ function M:Keybind(o)
 			if i.UserInputType ~= Enum.UserInputType.Keyboard then return end
 			conn:Disconnect()
 			key = (i.KeyCode ~= Enum.KeyCode.Escape) and i.KeyCode or nil
-			task.defer(function() listening = false end) -- after this key press has been handled elsewhere
+			listening = false
+			obj.boundAt = os.clock()
 			show()
 			if o.Callback then task.spawn(o.Callback, key) end
 		end)
