@@ -104,7 +104,7 @@ local function unload()
 	Farm.Changed = nil
 	if getgenv then getgenv().__BackflipFarm = nil end
 end
-tSet:Label({ Name = "Version", Value = env.ScrdsxVersion or "?" })
+tSet:Label({ Name = "Version", Value = tostring(env.ScrdsxVersion or "?") .. " (" .. tostring(env.ScrdsxCommit or "?") .. ")" })
 tSet:Button({ Name = "Update now (reload latest)", Callback = function()
 	if not env.ScrdsxReload then win:Notify("Reload not available"); return end
 	local reload = env.ScrdsxReload

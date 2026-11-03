@@ -6,21 +6,44 @@ local BASE = env.ScrdsxBase or "http://localhost:8000/"
 local LOCAL = env.ScrdsxLocal
 local MODULES = { "ui", "farm", "loading", "main" } -- main last
 
+-- raw.githubusercontent.com caches files for ~5 minutes (and some executors cache on top), so a plain
+-- fetch can hand back an old release. Pin to the latest commit SHA instead: those URLs never go stale.
+local POLL_BASE = BASE -- the update watcher keeps polling the branch URL
+local commit
+if not LOCAL then
+	local owner, repo, branch = BASE:match("raw%.githubusercontent%.com/([^/]+)/([^/]+)/([^/]+)/")
+	if owner then
+		local ok, body = pcall(function()
+			return game:HttpGet(("https://api.github.com/repos/%s/%s/commits/%s"):format(owner, repo, branch))
+		end)
+		if ok then
+			local okj, data = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+			if okj and type(data) == "table" and type(data.sha) == "string" then
+				commit = data.sha
+				BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(owner, repo, commit)
+			end
+		end
+	end
+end
+env.ScrdsxCommit = commit and commit:sub(1, 7) or "unpinned"
+
 local sources, cache = {}, {}
 
 -- version check support: main.lua polls this to notice a new release
 local function fetchVersion()
 	local v
 	if LOCAL then v = readfile(LOCAL .. "version.txt")
-	else v = game:HttpGet(BASE .. "version.txt?t=" .. os.time()) end
+	else v = game:HttpGet(POLL_BASE .. "version.txt?t=" .. os.time()) end
 	return (v:gsub("%s+", ""))
 end
 env.ScrdsxFetchVersion = fetchVersion
-local okv, ver = pcall(fetchVersion)
+local okv, ver
+if commit then okv, ver = pcall(function() return (game:HttpGet(BASE .. "version.txt"):gsub("%s+", "")) end)
+else okv, ver = pcall(fetchVersion) end
 env.ScrdsxVersion = okv and ver or "unknown"
 env.ScrdsxReload = function() -- re-run this loader (used by "Update now")
 	if LOCAL then return loadstring(readfile(LOCAL .. "loader.lua"))() end
-	return loadstring(game:HttpGet(BASE .. "loader.lua?t=" .. os.time()))()
+	return loadstring(game:HttpGet(POLL_BASE .. "loader.lua?t=" .. os.time()))()
 end
 
 local function fetch(name)
