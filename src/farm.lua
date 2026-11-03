@@ -1,42 +1,78 @@
--- Self-driving backflip farm: rides a safe route (recorded, or a straight shuttle), backflips every
--- FlipSpacing studs, repeats. The server detects tricks from physics; TrickState reports the result.
+-- Self-driving backflip farm: rides a safe route (saved to file, or a straight shuttle), pops a held wheelie,
+-- backflips out of it, levels the ride for landing, then carries on. The server detects tricks from physics;
+-- TrickState reports the result.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local RS = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
 
 local lp = Players.LocalPlayer
 local env = getgenv and getgenv() or _G
+local ROUTE_FILE = "ScrdsxBackflipRoute.json"
 
 local Farm = {
 	Config = {
 		CruiseSpeed = 40,    -- studs/s while riding the route
 		JumpVy = 90,         -- launch speed; airtime = 2*vy/g
 		MaxVy = 120,         -- auto-raise ceiling (higher = harder landing, may trigger the game's fall bail)
-		FlipSpacing = 45,    -- studs ridden between flips
-		Cooldown = 0.4,      -- minimum seconds between flips
-		ShuttleLength = 140, -- studs, used when no route is recorded
+		FlipSpacing = 60,    -- studs ridden between tricks
+		Cooldown = 0.4,      -- minimum seconds between tricks
+		ShuttleLength = 160, -- studs, used when no route is saved
 		TurnRate = 3,        -- rad/s steering at corners and ends
 		LandGap = 10,        -- ray length counted as grounded (the seat sits well above the road)
 		AutoRaise = true,    -- raise JumpVy when a flip fails to register
 		AvoidObstacles = true,
+		Wheelie = true,      -- hold a wheelie, then backflip out of it
+		WheelieTime = 1.0,   -- seconds held before the flip
+		WheeliePitch = 40,   -- degrees the nose is held at
+		LoopRoute = true,    -- loop when the route's ends meet, otherwise ride it back and forth
+		MaxRouteDist = 250,  -- refuse to drive if the route is farther than this from you
 	},
 	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "Shuttle", gate = "-" },
 	Enabled = false,
 	Recording = false,
-	Route = env.__ScrdsxRoute or {},
+	Route = {},
 	Changed = nil,
 }
 
 local conns = {}
 local flipping, lastEnd, dir, attempt, pending = false, 0, 1, 0, false
-local pts, idx, step, fwd = {}, 1, 1, 1
-local distSince, lastPos, blockedSince, lastRec = 0, nil, nil, nil
+local pts, idx, step, fwd, loop = {}, 1, 1, 1, false
+local distSince, lastPos, blockedSince, lastRec, pathRetry = 0, nil, nil, nil, 0
 local flipConn
 
 local function changed() if Farm.Changed then Farm.Changed() end end
 local function status(s) if Farm.Stats.status ~= s then Farm.Stats.status = s; changed() end end
 local function flat(v) return Vector3.new(v.X, 0, v.Z) end
 
+-- route persistence ----------------------------------------------------------
+local function saveRoute()
+	pcall(function()
+		local t = {}
+		for i, p in ipairs(Farm.Route) do t[i] = { p.X, p.Y, p.Z } end
+		writefile(ROUTE_FILE, HttpService:JSONEncode(t))
+	end)
+end
+
+local function loadRoute()
+	local ok, res = pcall(function()
+		if isfile and isfile(ROUTE_FILE) then return HttpService:JSONDecode(readfile(ROUTE_FILE)) end
+	end)
+	if ok and type(res) == "table" then
+		local r = {}
+		for i, p in ipairs(res) do r[i] = Vector3.new(p[1], p[2], p[3]) end
+		return r
+	end
+end
+
+Farm.Route = env.__ScrdsxRoute or loadRoute() or {}
+env.__ScrdsxRoute = Farm.Route
+if #Farm.Route >= 2 then
+	Farm.Stats.points = #Farm.Route
+	Farm.Stats.mode = "Saved route (" .. #Farm.Route .. " pts)"
+end
+
+-- helpers --------------------------------------------------------------------
 local function seat()
 	local c = lp.Character
 	local h = c and c:FindFirstChildOfClass("Humanoid")
@@ -62,7 +98,7 @@ local function blocked(s, forward, dist)
 	return hit ~= nil and hit.Instance.CanCollide
 end
 
--- the ride's stabilizers fight our spin: release them for the flip, restore afterwards
+-- the ride's stabilizers fight our spin: release them for the trick, restore afterwards
 local function releaseStabilizers(model)
 	local saved = {}
 	for _, d in ipairs(model:GetDescendants()) do
@@ -79,51 +115,66 @@ local function releaseStabilizers(model)
 	end
 end
 
-local function buildPath(s)
-	local n = #Farm.Route
-	if n >= 2 then
-		pts = {}
-		for i, p in ipairs(Farm.Route) do pts[i] = p end
-		local best, bd = 1, math.huge
-		for i, p in ipairs(pts) do
-			local d = flat(p - s.Position).Magnitude
-			if d < bd then best, bd = i, d end
-		end
-		idx, step = best, (best >= #pts) and -1 or 1
-		Farm.Stats.mode = "Route (" .. n .. " pts)"
-	else
-		local f = flat(s.CFrame.LookVector) * fwd
-		f = f.Magnitude > 0.01 and f.Unit or Vector3.new(0, 0, -1)
-		pts = { s.Position, s.Position + f * Farm.Config.ShuttleLength }
-		idx, step = 2, -1 -- ride out to the far point, then back
-		Farm.Stats.mode = "Shuttle"
-	end
-	Farm.Stats.points = #pts
+-- route walking --------------------------------------------------------------
+local function nextIdx(i)
+	if loop then return (i % #pts) + 1 end
+	local n = i + step
+	if n < 1 or n > #pts then return nil end
+	return n
 end
 
 local function advance()
-	local nxt = idx + step
-	if nxt < 1 or nxt > #pts then
-		step = -step
-		nxt = idx + step
-	end
-	idx = math.clamp(nxt, 1, #pts)
+	local n = nextIdx(idx)
+	if not n then step = -step; n = idx + step end
+	idx = math.clamp(n, 1, #pts)
 end
 
--- walk the route ahead of `pos` for `dist` studs: returns the point reached, distance walked, and whether the route ended first
+-- walk the route ahead of `pos` for `dist` studs: the point reached, distance walked, and whether the route ended first
 local function lookahead(pos, dist)
 	local cur, walked, i = pos, 0, idx
-	while true do
+	for _ = 1, #pts + 2 do
 		local p = pts[i]
 		walked += flat(p - cur).Magnitude
 		cur = p
 		if walked >= dist then return cur, walked, false end
-		local nxt = i + step
-		if nxt < 1 or nxt > #pts then return cur, walked, true end
-		i = nxt
+		local n = nextIdx(i)
+		if not n then return cur, walked, true end
+		i = n
 	end
+	return cur, walked, false
 end
 
+local function buildPath(s)
+	local cfg = Farm.Config
+	local n = #Farm.Route
+	if n >= 2 then
+		local best, bd = 1, math.huge
+		for i, p in ipairs(Farm.Route) do
+			local d = flat(p - s.Position).Magnitude
+			if d < bd then best, bd = i, d end
+		end
+		if bd > cfg.MaxRouteDist then
+			status(("Too far from route (%d studs)"):format(bd))
+			return false
+		end
+		pts = {}
+		for i, p in ipairs(Farm.Route) do pts[i] = p end
+		loop = cfg.LoopRoute and flat(pts[1] - pts[n]).Magnitude < 40
+		idx, step = best, (best >= #pts and not loop) and -1 or 1
+		Farm.Stats.mode = (loop and "Loop" or "Route") .. " (" .. n .. " pts)"
+	else
+		local f = flat(s.CFrame.LookVector) * fwd
+		f = f.Magnitude > 0.01 and f.Unit or Vector3.new(0, 0, -1)
+		pts = { s.Position, s.Position + f * cfg.ShuttleLength }
+		loop, idx, step = false, 2, -1 -- ride out to the far point, then back
+		Farm.Stats.mode = "Shuttle"
+	end
+	Farm.Stats.points = #pts
+	changed()
+	return true
+end
+
+-- getting back on ------------------------------------------------------------
 local lastSeatTry = 0
 -- after a bail or dismount: find our ride, move next to it and sit / press its prompt
 local function reseat()
@@ -154,19 +205,27 @@ local function reseat()
 	distSince, lastPos, blockedSince = 0, nil, nil
 end
 
-local function backflip(s, ahead)
+-- tricks ---------------------------------------------------------------------
+local function endTrick(restore)
+	restore()
+	flipping = false
+	lastEnd, distSince, lastPos = os.clock(), 0, nil
+end
+
+-- backflip: jump + spin, then hold the ride level until it lands
+local function backflip(s, ahead, restoreIn)
 	local cfg = Farm.Config
 	flipping, pending = true, true
 	attempt += 1
 	local myAttempt = attempt
 	local airtime = 2 * cfg.JumpVy / workspace.Gravity
 	local w = 2 * math.pi / (airtime * 0.6) * dir -- finish the turn well before landing
-	local restore = releaseStabilizers(s.Parent)
+	local restore = restoreIn or releaseStabilizers(s.Parent)
 	local hv = ahead * cfg.CruiseSpeed * 0.7 -- slower over the jump = shorter flight
 	s.AssemblyLinearVelocity = Vector3.new(hv.X, cfg.JumpVy, hv.Z)
 	status("Flipping")
 
-	local turned, t, cfMode = 0, 0, false
+	local turned, t, cfMode, landUntil = 0, 0, false, nil
 	local prevUp = s.CFrame.UpVector
 	flipConn = RunService.Heartbeat:Connect(function(dt)
 		dt = math.min(dt, 0.05)
@@ -178,6 +237,26 @@ local function backflip(s, ahead)
 			return
 		end
 		t += dt
+		if landUntil then
+			-- landing assist: keep the ride level until it touches down
+			s.AssemblyAngularVelocity = Vector3.zero
+			local fl = flat(s.CFrame.LookVector)
+			if fl.Magnitude > 0.05 then s.CFrame = CFrame.lookAt(s.Position, s.Position + fl.Unit) end
+			if os.clock() > landUntil then
+				flipConn:Disconnect()
+				endTrick(restore)
+				status("Landing")
+				task.delay(4, function()
+					if pending and attempt == myAttempt then
+						pending = false
+						Farm.Stats.fails += 1
+						if cfg.AutoRaise then cfg.JumpVy = math.min(cfg.JumpVy + 5, cfg.MaxVy) end
+						status("Missed, retrying")
+					end
+				end)
+			end
+			return
+		end
 		local right = s.CFrame.RightVector
 		if cfMode then
 			s.AssemblyAngularVelocity = Vector3.zero
@@ -191,28 +270,55 @@ local function backflip(s, ahead)
 		prevUp = up
 		if not cfMode and t > 0.25 and turned < 0.3 then cfMode = true end -- physics isn't turning it: drive the CFrame
 		if turned >= 2 * math.pi * 0.98 or t > airtime + 0.6 then
-			flipConn:Disconnect()
-			s.AssemblyAngularVelocity = Vector3.zero
-			local fl = flat(s.CFrame.LookVector)
-			if fl.Magnitude > 0.05 then
-				s.CFrame = CFrame.lookAt(s.Position, s.Position + fl.Unit) -- upright, keep yaw
-			end
-			restore()
-			flipping = false
-			lastEnd, distSince, lastPos = os.clock(), 0, nil
-			status("Landing")
-			task.delay(4, function()
-				if pending and attempt == myAttempt then
-					pending = false
-					Farm.Stats.fails += 1
-					if cfg.AutoRaise then cfg.JumpVy = math.min(cfg.JumpVy + 5, cfg.MaxVy) end
-					status("Missed, retrying")
-				end
-			end)
+			landUntil = os.clock() + math.max(0.2, airtime - t) + 0.25
 		end
 	end)
 end
 
+-- wheelie: raise the nose to a held angle while riding, then hand over to the backflip
+local function wheelieThenFlip(s, ahead)
+	local cfg = Farm.Config
+	flipping = true
+	status("Wheelie")
+	local restore = releaseStabilizers(s.Parent)
+	local hv = ahead * cfg.CruiseSpeed * 0.8
+	local target = math.rad(cfg.WheeliePitch)
+	local t = 0
+	flipConn = RunService.Heartbeat:Connect(function(dt)
+		dt = math.min(dt, 0.05)
+		if not Farm.Enabled or not s.Parent or seat() ~= s then
+			flipConn:Disconnect()
+			restore()
+			flipping = false
+			status("Idle")
+			return
+		end
+		t += dt
+		-- pitch measured in the same rotation direction the backflip will use
+		local pitch = dir * math.asin(math.clamp(s.CFrame.LookVector.Y, -1, 1))
+		local err = target * math.min(t / 0.5, 1) - pitch
+		s.AssemblyAngularVelocity = s.CFrame.RightVector * dir * math.clamp(err * 8, -4, 4)
+		local v = s.AssemblyLinearVelocity
+		s.AssemblyLinearVelocity = Vector3.new(hv.X, v.Y, hv.Z)
+		if pitch > math.rad(80) then -- going over: abort, level out
+			flipConn:Disconnect()
+			s.AssemblyAngularVelocity = Vector3.zero
+			local fl = flat(s.CFrame.LookVector)
+			if fl.Magnitude > 0.05 then s.CFrame = CFrame.lookAt(s.Position, s.Position + fl.Unit) end
+			endTrick(restore)
+			status("Wheelie too steep, aborted")
+		elseif (t >= cfg.WheelieTime and pitch >= target * 0.7) or t > 2.5 then
+			flipConn:Disconnect()
+			backflip(s, ahead, restore)
+		end
+	end)
+end
+
+local function startTrick(s, ahead)
+	if Farm.Config.Wheelie then wheelieThenFlip(s, ahead) else backflip(s, ahead) end
+end
+
+-- driving --------------------------------------------------------------------
 local function drive(s, dt)
 	local cfg = Farm.Config
 	local pos = s.Position
@@ -238,6 +344,7 @@ local function drive(s, dt)
 		s.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
 		status("Blocked, turning back")
 		if os.clock() - blockedSince > 0.8 then
+			loop = false
 			step = -step
 			idx = math.clamp(idx + step, 1, #pts)
 			blockedSince = nil
@@ -254,24 +361,24 @@ local function drive(s, dt)
 	if lastPos then distSince += flat(pos - lastPos).Magnitude end
 	lastPos = pos
 
-	-- flip when far enough from the last one, with room to land before the next turn
+	-- trick when far enough from the last one, with a straight, clear run for the wheelie + flight
 	local airtime = 2 * cfg.JumpVy / workspace.Gravity
-	local flight = cfg.CruiseSpeed * 0.7 * airtime
+	local run = cfg.CruiseSpeed * 0.7 * airtime
+	if cfg.Wheelie then run += cfg.CruiseSpeed * 0.8 * (cfg.WheelieTime + 0.5) end
 	local gate
 	if distSince < cfg.FlipSpacing then gate = ("riding %d/%d studs"):format(distSince, cfg.FlipSpacing)
 	elseif math.abs(ang) >= 0.3 then gate = "turning"
 	elseif os.clock() - lastEnd < cfg.Cooldown then gate = "cooldown"
 	elseif not grounded(s) then gate = "not grounded"
-	elseif cfg.AvoidObstacles and blocked(s, nf, flight + 10) then gate = "obstacle ahead"
+	elseif cfg.AvoidObstacles and blocked(s, nf, run + 10) then gate = "obstacle ahead"
 	end
 	if not gate then
-		-- room to land: the route ahead must be long enough and roughly straight (the flight is a straight line)
-		local pt, walked, atEnd = lookahead(pos, flight + 12)
-		if atEnd and walked < flight + 12 then gate = "end of route too close"
+		local pt, walked, atEnd = lookahead(pos, run + 12)
+		if atEnd and walked < run + 12 then gate = "end of route too close"
 		elseif flat(pt - pos).Magnitude < walked * 0.9 then gate = "curve ahead" end
 	end
-	if Farm.Stats.gate ~= (gate or "flipping") then Farm.Stats.gate = gate or "flipping"; changed() end
-	if not gate then backflip(s, nf) end
+	if Farm.Stats.gate ~= (gate or "go") then Farm.Stats.gate = gate or "go"; changed() end
+	if not gate then startTrick(s, nf) end
 end
 
 table.insert(conns, RunService.Heartbeat:Connect(function(dt)
@@ -281,15 +388,18 @@ table.insert(conns, RunService.Heartbeat:Connect(function(dt)
 		if s and (not lastRec or flat(s.Position - lastRec).Magnitude >= 6) then
 			table.insert(Farm.Route, s.Position)
 			lastRec = s.Position
-			env.__ScrdsxRoute = Farm.Route
 			Farm.Stats.points = #Farm.Route
 			changed()
 		end
 	end
-	if not Farm.Enabled or flipping then return end
+	if not Farm.Enabled or flipping or Farm.Recording then return end
 	local s = seat()
 	if not s then reseat(); return end
-	if #pts == 0 then buildPath(s) end
+	if #pts == 0 then
+		if os.clock() - pathRetry < 1 then return end
+		pathRetry = os.clock()
+		if not buildPath(s) then return end
+	end
 	drive(s, math.min(dt, 0.05))
 end))
 
@@ -309,15 +419,15 @@ task.spawn(function()
 	end))
 end)
 
+-- API ------------------------------------------------------------------------
 function Farm:SetEnabled(v)
+	pts = {}
 	if v then
-		pts = {}
 		local s = seat()
 		if s then
 			-- which way is "forward"? use the current motion if the ride is moving
 			local vel, look = flat(s.AssemblyLinearVelocity), flat(s.CFrame.LookVector)
 			if vel.Magnitude > 5 and look.Magnitude > 0.05 then fwd = vel:Dot(look) >= 0 and 1 or -1 end
-			buildPath(s)
 		end
 		distSince, lastPos, blockedSince = 0, nil, nil
 	else
@@ -335,9 +445,15 @@ function Farm:SetRecording(v)
 		env.__ScrdsxRoute = self.Route
 		lastRec = nil
 		self.Stats.points = 0
+		self.Stats.mode = "Recording..."
 	elseif #self.Route < 2 then
 		self:ClearRoute()
 		return
+	else
+		saveRoute()
+		pts = {} -- rebuild from the new route
+		self.Stats.points = #self.Route
+		self.Stats.mode = "Saved route (" .. #self.Route .. " pts)"
 	end
 	changed()
 end
@@ -345,22 +461,24 @@ end
 function Farm:ClearRoute()
 	self.Route = {}
 	env.__ScrdsxRoute = self.Route
+	pts = {}
+	pcall(function() if delfile and isfile and isfile(ROUTE_FILE) then delfile(ROUTE_FILE) end end)
 	self.Stats.points, self.Stats.mode = 0, "Shuttle"
 	changed()
 end
 
--- fire one flip right now (for testing the spin without waiting for the route)
+-- fire one trick right now (for testing without waiting for the route)
 function Farm:TestFlip()
 	local s = seat()
 	if not s or flipping then return end
 	local nf = flat(s.CFrame.LookVector) * fwd
 	nf = nf.Magnitude > 0.05 and nf.Unit or Vector3.new(0, 0, -1)
 	self.Enabled = true
-	backflip(s, nf)
+	startTrick(s, nf)
 end
 
 function Farm:FlipDirection() dir = -dir; self.Stats.direction = dir == 1 and "Back" or "Front"; changed() end
-function Farm:FlipForward() fwd = -fwd end
+function Farm:FlipForward() fwd = -fwd; pts = {} end
 
 function Farm:Reset()
 	self.Stats.earned, self.Stats.flips, self.Stats.fails, self.Stats.last = 0, 0, 0, "-"
