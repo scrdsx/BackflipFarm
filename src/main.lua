@@ -51,6 +51,15 @@ tRoute:Button({ Name = "Swap ride forward/back", Callback = function()
 end })
 tRoute:Button({ Name = "Swap flip direction", Callback = function() Farm:FlipDirection() end })
 
+-- Manual tab: a backflip whenever you want one, for fun (Autofarm must be off)
+local tManual = win:Tab("Manual")
+local manualKey = tManual:Keybind({ Name = "Backflip key (click, then press a key)", Default = Enum.KeyCode.B })
+tManual:Button({ Name = "Backflip now", Callback = function()
+	if not Farm:ManualFlip() then win:Notify(Farm.Enabled and "Turn Autofarm off first" or "Get on your ride first") end
+end })
+tManual:Slider({ Name = "Manual jump power", Min = 40, Max = 140, Step = 5, Default = cfg.ManualVy, Callback = function(v) cfg.ManualVy = v end })
+tManual:Label({ Name = "Keeps your speed and direction", Value = "Esc clears the key" })
+
 -- Stats tab
 local tStats = win:Tab("Stats")
 local lStatus = tStats:Label({ Name = "Status" })
@@ -111,6 +120,8 @@ if getgenv then getgenv().__BackflipFarm = unload end
 table.insert(win.conns, UIS.InputBegan:Connect(function(i, gp)
 	if i.KeyCode == Enum.KeyCode.RightShift then
 		win:Toggle()
+	elseif not gp and not manualKey:IsListening() and manualKey:Get() and i.KeyCode == manualKey:Get() then
+		if not Farm:ManualFlip() then win:Notify(Farm.Enabled and "Turn Autofarm off first" or "Get on your ride first") end
 	elseif not gp and i.KeyCode == Enum.KeyCode.Slash then
 		win.searchBox:CaptureFocus()
 		task.defer(function() win.searchBox.Text = "" end)

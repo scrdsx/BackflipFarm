@@ -383,5 +383,41 @@ function M:Slider(o)
 	return obj
 end
 
+-- click, then press a key to bind it (Escape clears). Callback(key) gets an Enum.KeyCode or nil.
+function M:Keybind(o)
+	local f = row(self, o.Name, 40)
+	local n = label(o.Name, 13, T.text); n.Position = UDim2.fromOffset(14, 0); n.Size = UDim2.new(1, -130, 1, 0); n.Parent = f
+	local btn = new("TextButton", {
+		AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, -10, .5, 0), Size = UDim2.fromOffset(104, 26),
+		BackgroundColor3 = T.hover, BorderSizePixel = 0, AutoButtonColor = false, Text = "", Parent = f,
+	}, { corner(6), stroke(T.stroke) })
+	local txt = label("", 12, T.text, T.bold, Enum.TextXAlignment.Center); txt.Size = UDim2.fromScale(1, 1); txt.Parent = btn
+	local key, listening, conn = o.Default, false, nil
+	local obj = {}
+	local function show()
+		txt.Text = listening and "Press a key..." or (key and key.Name or "None")
+		tween(txt, .15, { TextColor3 = listening and T.accent or T.text })
+	end
+	function obj:Get() return key end
+	function obj:IsListening() return listening end
+	function obj:Set(k) key = k; show() end
+	btn.MouseButton1Click:Connect(function()
+		if listening then return end
+		listening = true
+		show()
+		conn = UIS.InputBegan:Connect(function(i)
+			if i.UserInputType ~= Enum.UserInputType.Keyboard then return end
+			conn:Disconnect()
+			key = (i.KeyCode ~= Enum.KeyCode.Escape) and i.KeyCode or nil
+			task.defer(function() listening = false end) -- after this key press has been handled elsewhere
+			show()
+			if o.Callback then task.spawn(o.Callback, key) end
+		end)
+		table.insert(self.win.conns, conn)
+	end)
+	show()
+	return obj
+end
+
 UI.Theme = T
 return UI

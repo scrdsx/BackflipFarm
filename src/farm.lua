@@ -27,6 +27,7 @@ local Farm = {
 		MaxBend = 70,        -- degrees of route turning a trick may cover (the ride follows the route in the air)
 		MaxRouteDist = 250,  -- studs: nearest road must be closer than this
 		Bounce = false,      -- true: ride the straightest road back and forth instead of a circuit
+		ManualVy = 90,       -- jump power for a manual (keybind) backflip
 	},
 	Stats = { earned = 0, flips = 0, fails = 0, last = "-", direction = "Back", status = "Idle", points = 0, mode = "-", gate = "-", road = "-", startedAt = 0 },
 	Enabled = false,
@@ -487,7 +488,7 @@ local function finishTrick()
 	trick = nil
 	T.restore()
 	lastEnd = os.clock()
-	status("Riding")
+	status(Farm.Enabled and "Riding" or "Idle")
 	if T.launched then
 		local id = T.id
 		task.delay(6, function() -- the server reports "landed"; if it never does, count a miss
@@ -496,8 +497,8 @@ local function finishTrick()
 				local cfg = Farm.Config
 				Farm.Stats.fails += 1
 				streak = 0
-				if cfg.AutoTune then cfg.JumpVy = math.min(cfg.JumpVy + 10, cfg.MaxVy) end
-				status("Missed, retrying")
+				if cfg.AutoTune and not T.manual then cfg.JumpVy = math.min(cfg.JumpVy + 10, cfg.MaxVy) end
+				status(Farm.Enabled and "Missed, retrying" or "Idle")
 			end
 		end)
 	end
@@ -513,21 +514,33 @@ local function launch(s)
 	local T = trick
 	T.phase, T.t, T.turned, T.launched = "spin", 0, 0, true
 	T.prevUp = s.CFrame.UpVector
-	T.airtime = 2 * cfg.JumpVy / workspace.Gravity
+	T.vy = T.manual and cfg.ManualVy or cfg.JumpVy
+	T.airtime = 2 * T.vy / workspace.Gravity
 	T.w = 2 * math.pi / (T.airtime * 0.6) * dir -- finish the turn well before landing
 	T.launchAt = os.clock()
 	pending, pendingId = true, T.id
-	s.AssemblyLinearVelocity = Vector3.new(vdir.X * cfg.CruiseSpeed, cfg.JumpVy, vdir.Z * cfg.CruiseSpeed)
+	local hv = T.manual and T.hv or vdir * cfg.CruiseSpeed -- a manual flip keeps your own speed and direction
+	s.AssemblyLinearVelocity = Vector3.new(hv.X, T.vy, hv.Z)
 	status("Flipping")
 end
 
-local function startTrick(s)
+local function startTrick(s, manual)
 	local cfg = Farm.Config
+	attempt += 1
+	if manual then
+		-- your own backflip: keep the speed and direction you are riding at, jump straight into the spin
+		local hv = flat(s.AssemblyLinearVelocity)
+		local f = flat(s.CFrame.LookVector) * fwd
+		if hv.Magnitude < 3 then hv = f * 0 end
+		vdir = hv.Magnitude > 3 and hv.Unit or (f.Magnitude > 0.05 and f.Unit or Vector3.new(0, 0, -1))
+		trick = { id = attempt, phase = "spin", t = 0, manual = true, hv = hv, restore = releaseStabilizers(s.Parent) }
+		launch(s)
+		return
+	end
 	if not vdir then
 		local f = flat(s.CFrame.LookVector) * fwd
 		vdir = f.Magnitude > 0.05 and f.Unit or Vector3.new(0, 0, -1)
 	end
-	attempt += 1
 	trick = { id = attempt, phase = cfg.Wheelie and "wheelie" or "spin", t = 0, restore = releaseStabilizers(s.Parent) }
 	if trick.phase == "spin" then launch(s) else status("Wheelie") end
 end
@@ -540,10 +553,16 @@ local function stepTrick(s, dt)
 		local f = flat(s.CFrame.LookVector) * fwd
 		vdir = f.Magnitude > 0.05 and f.Unit or Vector3.new(0, 0, -1)
 	end
-	if #pts > 0 then updateDirection(s.Position, dt) end -- the ride keeps following the route, in the air too
+	if #pts > 0 and not T.manual then updateDirection(s.Position, dt) end -- the ride keeps following the route, in the air too
 	local d = vdir
 	local vy = s.AssemblyLinearVelocity.Y
-	local function horizontal() s.AssemblyLinearVelocity = Vector3.new(d.X * cfg.CruiseSpeed, vy, d.Z * cfg.CruiseSpeed) end
+	local function horizontal()
+		if T.manual then
+			s.AssemblyLinearVelocity = Vector3.new(T.hv.X, vy, T.hv.Z) -- keep your speed and direction
+		else
+			s.AssemblyLinearVelocity = Vector3.new(d.X * cfg.CruiseSpeed, vy, d.Z * cfg.CruiseSpeed)
+		end
+	end
 
 	if T.phase == "wheelie" then
 		-- hold the nose up at a set angle (measured in the same rotation direction the flip will use)
@@ -707,6 +726,14 @@ function Farm:TestFlip()
 	local s = seat()
 	if not s or trick then return end
 	startTrick(s)
+end
+
+-- a backflip on demand while you ride (the farm must be off, it would fight you for control)
+function Farm:ManualFlip()
+	local s = seat()
+	if not s or trick or self.Enabled then return false end
+	startTrick(s, true)
+	return true
 end
 
 function Farm:FlipDirection() dir = -dir; self.Stats.direction = dir == 1 and "Back" or "Front"; changed() end
